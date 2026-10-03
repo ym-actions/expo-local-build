@@ -94,8 +94,8 @@ jobs:
 
 Then go to **Actions → Build → Run workflow**, pick a profile, and download the binary from the run's artifacts when it finishes.
 
-> [!TIP]
-> Instead of listing secrets you can use `secrets: inherit`.
+> [!IMPORTANT]
+> `secrets: inherit` only works when the calling repository is in the **same organization or enterprise** as this workflow (`ym-actions`). From any other account or organization it silently passes nothing, and the run fails with *Missing EXPO_TOKEN*. Pass secrets explicitly, as above. The examples below use `secrets: inherit` for brevity, so swap it for an explicit list in your own repositories.
 
 ---
 
@@ -122,7 +122,9 @@ Use GitHub [environments](https://docs.github.com/en/actions/deployment/targetin
     with:
       profile: ${{ inputs.profile }}
       environment: ${{ inputs.profile }}
-    secrets: inherit
+    secrets:
+      EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+      DOPPLER_TOKEN: ${{ secrets.DOPPLER_TOKEN }} # the environment's value wins
 ```
 
 When the job runs in an environment, that environment's secrets take precedence over secrets passed by the caller.
@@ -334,6 +336,18 @@ To speed up internal builds, restrict the ABIs in the build profile:
 ### Ship JS changes without rebuilding
 
 A native build is only needed when native code or config changes. Those are new libraries with native code, config plugins, and `app.json` permissions or entitlements. JS-only changes can go out with `eas update`, which doesn't need a build at all.
+
+### "Missing EXPO_TOKEN" although the secret exists
+
+You're most likely calling the workflow with `secrets: inherit` from a repository outside the `ym-actions` organization. [GitHub only passes inherited secrets within one organization or enterprise](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows). Pass each secret explicitly:
+
+```yaml
+    secrets:
+      EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+      DOPPLER_TOKEN: ${{ secrets.DOPPLER_TOKEN }}
+```
+
+Environment secrets are the exception. When the job runs in an `environment`, that environment's secrets are used directly, whatever the caller passes. The secret still has to be declared by this workflow (`EXPO_TOKEN`, `DOPPLER_TOKEN` or `BUILD_ENV`).
 
 ### "Missing EXPO_TOKEN" on pull requests from forks
 

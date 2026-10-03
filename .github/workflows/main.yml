@@ -261,6 +261,7 @@ jobs:
             if [ "$IS_FORK" = "true" ]; then
               echo "::error::This pull request comes from a fork, so repository secrets are not available to it."
             fi
+            echo "::error::If the caller uses 'secrets: inherit' from another organization, no secrets are passed. Pass them explicitly instead: 'secrets: { EXPO_TOKEN: \${{ secrets.EXPO_TOKEN }} }'."
             exit 1
           fi
           if { [ -n "$DOPPLER_PROJECT" ] || [ -n "$DOPPLER_CONFIG" ]; } && [ "$HAS_DOPPLER_TOKEN" != "true" ]; then
