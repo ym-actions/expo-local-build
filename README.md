@@ -23,7 +23,10 @@
 - 📦 **Ready-to-Share Binaries:** Uploads the `.apk` / `.aab` / `.ipa` as a nicely named workflow artifact. It can also attach it to a GitHub Release, or hand it to `eas submit`.
 - 💬 **Sticky PR Comments:** On pull requests, the download link is posted on the PR and updated on every push. If a build fails, the comment says so.
 - 📦 **Zero-Config Toolchain:** Detects npm, pnpm, yarn (classic & berry) or bun, reads `.nvmrc` / `.node-version`, and sets up Java and the Android SDK when needed.
-- ⚙️ **Smart Caching:** Caches package manager downloads, Gradle and CocoaPods between runs.
+- ⚙️ **Smart Caching:** Caches package manager downloads, Gradle dependencies, Gradle's build cache and CocoaPods between runs. Caches are saved from the default branch, where every branch and tag can read them.
+- 🎯 **Build Only the ABIs You Need:** `android-architectures: arm64-v8a` covers almost every real phone and cuts native compile time roughly 4x for internal builds.
+- 🧱 **ccache for Native Code:** Optional ccache support covers your app *and* library C++ (expo-modules-core, reanimated, …), so unchanged native code compiles in seconds.
+- ⏱️ **Performance Report:** The job summary shows build time, cache sizes and ccache hit rate, so you can see what each setting buys you.
 - 💽 **Room to Build:** On Linux, removes preinstalled toolchains the build doesn't need, so multi-ABI native builds don't run out of disk.
 - 🗂️ **Monorepo Friendly:** Supports `working-directory`. Comments and concurrency groups are separated per app, platform and profile.
 - 🚦 **Safe Concurrency:** A newer push cancels an in-progress PR build. Other builds are queued, never cancelled mid-flight.
@@ -39,11 +42,12 @@ graph TD
     C -->|Missing EXPO_TOKEN / bad profile| X[Fail with clear error]
     C --> D[Free Disk Space · Linux]
     D --> E[Setup Node, Package Manager<br/>Java + Android SDK or CocoaPods]
-    E --> F[Restore Caches<br/>deps · Gradle · Pods]
+    E --> F[Restore Caches<br/>deps · Gradle · ccache · Pods]
     F --> G[Load Build Env<br/>Doppler → env → BUILD_ENV]
     G --> H[Install Dependencies & eas-cli]
     H --> I[eas build --local]
-    I --> J[Rename Binary<br/>slug-profile-version-sha.ext]
+    I --> I2[Cache Stats · Save ccache<br/>default branch only]
+    I2 --> J[Rename Binary<br/>slug-profile-version-sha.ext]
     J --> K{upload-artifact?}
     K -->|Yes| K1[Workflow Artifact]
     J --> L{Release tag?}
@@ -166,8 +170,20 @@ All inputs are optional. Boolean-like inputs take the strings `"true"` / `"false
 | `java-version`    | JDK version for Android builds.                                                                                     | `"17"`     |
 | `eas-cli-version` | Version of [`eas-cli`](https://www.npmjs.com/package/eas-cli) to install globally. Ignored when a local CLI is used. | `"latest"` |
 | `use-local-cli`   | Use `eas-cli` from your project's dependencies instead of installing it globally. Falls back to a global install, with a warning, if it isn't found. | `"false"` |
-| `cache`           | Cache package manager downloads, Gradle (Android) and CocoaPods (iOS).                                              | `"true"`   |
-| `free-disk-space` | On Linux, delete preinstalled toolchains the build doesn't use (.NET, Haskell, CodeQL, Swift, Docker images).       | `"true"`   |
+
+#### Performance
+
+See [Making Builds Faster](#-making-builds-faster) for how these fit together.
+
+| Input                   | Description                                                                                                         | Default    |
+| :---------------------- | :------------------------------------------------------------------------------------------------------------------ | :--------- |
+| `android-architectures` | Android ABIs to compile, comma-separated: `armeabi-v7a`, `arm64-v8a`, `x86`, `x86_64`. Empty builds the project's default (usually all four). | `""` |
+| `cache`                 | Cache package manager downloads, Gradle (dependencies, wrapper and build cache) and CocoaPods.                      | `"true"`   |
+| `cache-read-only`       | Restore the Gradle and ccache caches without saving them. `"auto"` saves only on the default branch.                | `"auto"`   |
+| `ccache`                | Compile C/C++ through [ccache](https://ccache.dev) and keep its cache between runs.                                 | `"false"`  |
+| `ccache-max-size`       | Maximum size of the ccache cache.                                                                                   | `"2G"`     |
+| `gradle-jvmargs`        | Override `org.gradle.jvmargs`, e.g. `"-Xmx6g -XX:MaxMetaspaceSize=1g"`. Empty keeps your project's value.          | `""`       |
+| `free-disk-space`       | On Linux, delete preinstalled toolchains the build doesn't use (.NET, Haskell, CodeQL, Swift, Docker images).       | `"true"`   |
 
 #### What to do with the build
 
@@ -229,6 +245,62 @@ A failure to post the PR comment never fails the build.
 | `build-type`    | `apk`, `aab`, `ipa`, or `tar.gz` for iOS simulator builds.         |
 | `app-version`   | App version from the Expo config.                                  |
 | `release-url`   | URL of the GitHub Release the binary was attached to.              |
+| `build-seconds` | Duration of the `eas build` step, in seconds.                      |
+
+---
+
+## 🚀 Making Builds Faster
+
+Most of an Android build's time goes into compiling C++ (React Native libraries and your app's codegen), once per ABI, then Kotlin. In order of payoff:
+
+### 1. Build fewer ABIs for internal builds
+
+Phones are almost all `arm64-v8a`. `x86` and `x86_64` only run on emulators, and `armeabi-v7a` only on old 32-bit devices. For development and preview builds you hand to testers, one ABI is enough:
+
+```yaml
+    with:
+      profile: ${{ inputs.profile }}
+      # all four for the store, arm64 only for everything else
+      android-architectures: ${{ inputs.profile != 'production' && 'arm64-v8a' || '' }}
+```
+
+> [!WARNING]
+> Write the expression as `!= 'production' && 'arm64-v8a' || ''`. The reverse (`== 'production' && '' || 'arm64-v8a'`) always gives `arm64-v8a`, because `''` is falsy in GitHub expressions.
+
+This sets the `reactNativeArchitectures` Gradle property for the app and every library module, through `ORG_GRADLE_PROJECT_reactNativeArchitectures`.
+
+### 2. Let the caches warm up on the default branch
+
+GitHub [scopes caches by ref](https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows#restrictions-for-accessing-a-cache). A run can read caches saved on its own branch or tag, and caches saved on the default branch. Caches saved on a tag or feature branch can't be used by anything else. So by default (`cache-read-only: "auto"`), the Gradle and ccache caches are **only saved from the default branch**. Every other run restores them.
+
+In practice, run a build from `main` now and then, for example with **Run workflow** on `main`, and your tag and PR builds start warm. Gradle caching uses [`gradle/actions/setup-gradle`](https://github.com/gradle/actions/tree/main/setup-gradle). It caches by content, prunes unused entries, and saves even when the build fails. The workflow also enables Gradle's build cache (`org.gradle.caching=true`, in the user-level `gradle.properties`, as EAS cloud does), so unchanged Kotlin and Java modules are restored instead of recompiled.
+
+### 3. Turn on ccache
+
+```yaml
+    with:
+      ccache: "true"
+```
+
+On Android, React Native only routes your app's own CMake project through ccache. The workflow also sets `CMAKE_C_COMPILER_LAUNCHER` / `CMAKE_CXX_COMPILER_LAUNCHER`, so library C++ is cached too. On iOS it sets `USE_CCACHE=1`, which React Native's pod setup honours. The cache lives where EAS cloud keeps it (`~/.cache/ccache` on Linux, `~/Library/Caches/ccache` on macOS), and the job summary reports the hit rate.
+
+The first run fills the cache and is slightly *slower*. Later runs with unchanged native code should show a high hit rate. If the summary shows **0 compilations**, the build didn't honour the launcher. Turn it off, and open an issue.
+
+> [!NOTE]
+> On iOS, if your Podfile passes `ccache_enabled:` to `react_native_post_install` explicitly, that value wins over `USE_CCACHE`. Enable it there, for example through `expo-build-properties` (`ios.ccacheEnabled`).
+
+### 4. Give Gradle more memory on big runners
+
+Out-of-memory errors or very slow Kotlin compiles usually mean the Gradle daemon's heap is too small for the runner. With 16 GB of RAM (standard runners for public repositories):
+
+```yaml
+    with:
+      gradle-jvmargs: "-Xmx6g -XX:MaxMetaspaceSize=1g"
+```
+
+### Reading the performance report
+
+Each run's summary includes the `eas build` duration, the whole job's duration, the ABIs built, Gradle cache sizes, the ccache hit rate, and whether caches were saved. Compare a few runs before and after changing a setting.
 
 ---
 
@@ -323,15 +395,7 @@ jobs:
 
 ### How long does a build take, and what does it cost?
 
-An Android release build that compiles native code for all four ABIs usually takes **20–35 minutes** on a standard runner the first time. Gradle caching shortens later runs. Standard runners are free for public repositories. For private repositories, the build uses your plan's included Actions minutes, and beyond that a per-minute rate. macOS runners (needed for iOS) bill at roughly ten times the Linux rate. Check [GitHub's billing docs](https://docs.github.com/en/billing/managing-billing-for-your-products/managing-billing-for-github-actions/about-billing-for-github-actions) for current figures.
-
-To speed up internal builds, restrict the ABIs in the build profile:
-
-```json
-"preview": {
-  "env": { "ORG_GRADLE_PROJECT_reactNativeArchitectures": "arm64-v8a" }
-}
-```
+An Android release build that compiles native code for all four ABIs usually takes **20–35 minutes** on a standard runner the first time. Building one ABI, warm caches and ccache bring that down a lot. See [Making Builds Faster](#-making-builds-faster). Standard runners are free for public repositories. For private repositories, the build uses your plan's included Actions minutes, and beyond that a per-minute rate. macOS runners (needed for iOS) bill at roughly ten times the Linux rate. Check [GitHub's billing docs](https://docs.github.com/en/billing/managing-billing-for-your-products/managing-billing-for-github-actions/about-billing-for-github-actions) for current figures.
 
 ### Ship JS changes without rebuilding
 
@@ -361,7 +425,7 @@ jobs:
 
 ### "No space left on device"
 
-Keep `free-disk-space: "true"` (the default), and consider limiting ABIs as shown above.
+Keep `free-disk-space: "true"` (the default), and consider building fewer ABIs with `android-architectures`.
 
 ### A variable works in EAS cloud builds but is empty here
 

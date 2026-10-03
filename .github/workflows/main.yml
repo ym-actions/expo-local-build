@@ -83,10 +83,37 @@ on:
         required: false
         default: "false"
         type: string
+
+      # ── Performance ─────────────────────────────────────────────────────────
+      android-architectures:
+        description: "Android ABIs to compile, comma-separated (armeabi-v7a, arm64-v8a, x86, x86_64). Empty builds the project's default (usually all four). 'arm64-v8a' alone covers almost every real phone and cuts native compile time ~4x"
+        required: false
+        default: ""
+        type: string
       cache:
-        description: "Cache package manager downloads and Gradle / CocoaPods files between runs"
+        description: "Cache package manager downloads, Gradle (dependencies + build cache) and CocoaPods between runs"
         required: false
         default: "true"
+        type: string
+      cache-read-only:
+        description: "Restore the Gradle and ccache caches without saving them: 'auto' (save only on the default branch, whose caches every branch and tag can read), 'true' or 'false'"
+        required: false
+        default: "auto"
+        type: string
+      ccache:
+        description: "Compile C/C++ through ccache and keep its cache between runs. Speeds up repeat builds whose native code hasn't changed"
+        required: false
+        default: "false"
+        type: string
+      ccache-max-size:
+        description: "Maximum size of the ccache cache (e.g. 2G)"
+        required: false
+        default: "2G"
+        type: string
+      gradle-jvmargs:
+        description: "Override org.gradle.jvmargs for the build (e.g. '-Xmx6g -XX:MaxMetaspaceSize=1g'). Empty keeps the project's value"
+        required: false
+        default: ""
         type: string
       free-disk-space:
         description: "On Linux runners, delete preinstalled toolchains the build doesn't need (.NET, Haskell, CodeQL, …) to make room for native builds"
@@ -195,6 +222,9 @@ on:
       release-url:
         description: "URL of the GitHub Release the binary was attached to"
         value: ${{ jobs.build.outputs.release-url }}
+      build-seconds:
+        description: "Duration of the eas build step, in seconds"
+        value: ${{ jobs.build.outputs.build-seconds }}
 
 jobs:
   build:
@@ -229,6 +259,7 @@ jobs:
       build-type: ${{ steps.build.outputs.type }}
       app-version: ${{ steps.build.outputs.version }}
       release-url: ${{ steps.release.outputs.url }}
+      build-seconds: ${{ steps.build.outputs.seconds }}
 
     steps:
       - name: Checkout
@@ -249,11 +280,15 @@ jobs:
           INPUT_BUILD_NAME: ${{ inputs.build-name }}
           INPUT_RELEASE: ${{ inputs.github-release }}
           INPUT_RELEASE_TAG: ${{ inputs.release-tag }}
+          INPUT_ARCHS: ${{ inputs.android-architectures }}
+          INPUT_CACHE_READ_ONLY: ${{ inputs.cache-read-only }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           DOPPLER_PROJECT: ${{ inputs.doppler-project }}
           DOPPLER_CONFIG: ${{ inputs.doppler-config }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
+          echo "started=$(date +%s)" >> "$GITHUB_OUTPUT"
 
           # ── Credentials ──────────────────────────────────────────────────
           if [ "$HAS_EXPO_TOKEN" != "true" ]; then
@@ -309,6 +344,34 @@ jobs:
             *) echo "::error::github-release must be 'auto', 'true' or 'false' (got '$INPUT_RELEASE')"; exit 1 ;;
           esac
 
+          # ── Android architectures ────────────────────────────────────────
+          ARCHS=""
+          if [ -n "$INPUT_ARCHS" ]; then
+            for arch in $(echo "$INPUT_ARCHS" | tr ',' ' '); do
+              case "$arch" in
+                armeabi-v7a|arm64-v8a|x86|x86_64) ARCHS="${ARCHS:+$ARCHS,}$arch" ;;
+                *) echo "::error::Unknown Android architecture '$arch' (expected armeabi-v7a, arm64-v8a, x86 or x86_64)"; exit 1 ;;
+              esac
+            done
+            [ "$PLATFORM" != "android" ] && echo "::notice::android-architectures is ignored for $PLATFORM builds."
+          fi
+
+          # ── Cache writes ─────────────────────────────────────────────────
+          # GitHub scopes caches by ref: a branch or tag can read its own caches and the
+          # default branch's. Caches saved from a tag or feature branch help no one else,
+          # so by default only the default branch saves.
+          case "$INPUT_CACHE_READ_ONLY" in
+            true|false) CACHE_READ_ONLY="$INPUT_CACHE_READ_ONLY" ;;
+            auto)
+              if [ "$GITHUB_REF" = "refs/heads/${DEFAULT_BRANCH:-main}" ]; then
+                CACHE_READ_ONLY=false
+              else
+                CACHE_READ_ONLY=true
+              fi
+              ;;
+            *) echo "::error::cache-read-only must be 'auto', 'true' or 'false' (got '$INPUT_CACHE_READ_ONLY')"; exit 1 ;;
+          esac
+
           # ── Node version ─────────────────────────────────────────────────
           NODE_VERSION=""
           NODE_VERSION_FILE=""
@@ -332,12 +395,16 @@ jobs:
             echo "release-tag=$RELEASE_TAG"
             echo "node-version=$NODE_VERSION"
             echo "node-version-file=$NODE_VERSION_FILE"
+            echo "archs=$ARCHS"
+            echo "cache-read-only=$CACHE_READ_ONLY"
           } >> "$GITHUB_OUTPUT"
 
           echo "Build:        $BUILD_NAME (profile '$PROFILE', $PLATFORM)"
           echo "Runner:       $RUNNER_OS"
           echo "Release tag:  ${RELEASE_TAG:-<none>}"
           echo "Node version: ${NODE_VERSION:-from $NODE_VERSION_FILE}"
+          [ "$PLATFORM" = "android" ] && echo "ABIs:         ${ARCHS:-project default}"
+          echo "Cache:        $([ "$CACHE_READ_ONLY" = "true" ] && echo "restore only" || echo "restore and save")"
 
       - name: Free Disk Space
         if: ${{ inputs.free-disk-space == 'true' && runner.os == 'Linux' }}
@@ -511,17 +578,16 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ steps.pm.outputs.name }}-
 
-      - name: Cache Gradle
-        if: ${{ inputs.cache == 'true' && inputs.platform == 'android' }}
-        uses: actions/cache@v4
+      # Caches ~/.gradle (dependencies, wrapper, build cache) by content, prunes stale
+      # entries before saving, and saves even when the build fails. EAS local builds
+      # use ~/.gradle too, so everything they download or produce is covered.
+      - name: Setup Gradle Cache
+        if: ${{ inputs.platform == 'android' }}
+        uses: gradle/actions/setup-gradle@v4
         with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ inputs.profile }}-${{ hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json', '**/pnpm-lock.yaml', '**/yarn.lock', '**/bun.lock', '**/bun.lockb') }}
-          restore-keys: |
-            ${{ runner.os }}-gradle-${{ inputs.profile }}-
-            ${{ runner.os }}-gradle-
+          cache-disabled: ${{ inputs.cache != 'true' }}
+          cache-read-only: ${{ steps.config.outputs.cache-read-only == 'true' }}
+          add-job-summary: on-failure
 
       - name: Cache CocoaPods
         if: ${{ inputs.cache == 'true' && inputs.platform == 'ios' }}
@@ -531,6 +597,30 @@ jobs:
           key: ${{ runner.os }}-pods-${{ hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json', '**/pnpm-lock.yaml', '**/yarn.lock', '**/bun.lock', '**/bun.lockb') }}
           restore-keys: |
             ${{ runner.os }}-pods-
+
+      - name: Install ccache
+        if: ${{ inputs.ccache == 'true' }}
+        run: |
+          if command -v ccache >/dev/null 2>&1; then
+            echo "ccache already installed"
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            brew install ccache
+          else
+            sudo apt-get update -qq && sudo apt-get install -y -qq ccache
+          fi
+          ccache --version | head -n1
+
+      - name: Restore ccache
+        if: ${{ inputs.ccache == 'true' }}
+        uses: actions/cache/restore@v4
+        with:
+          # Same folder EAS cloud builds use for ccache.
+          path: ${{ runner.os == 'macOS' && '~/Library/Caches/ccache' || '~/.cache/ccache' }}
+          # ccache's contents change every run, so each save gets a new key and
+          # restores pick the most recent one by prefix.
+          key: ${{ runner.os }}-ccache-${{ inputs.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-${{ inputs.platform }}-
 
       - name: Setup Doppler CLI
         if: ${{ steps.config.outputs.doppler == 'true' }}
@@ -600,6 +690,69 @@ jobs:
           fi
           load_env "env input" false "$PLAIN_ENV"
           load_env "BUILD_ENV secret" true "$SECRET_ENV"
+
+      - name: Configure Native Build
+        env:
+          PLATFORM: ${{ inputs.platform }}
+          ARCHS: ${{ steps.config.outputs.archs }}
+          CACHE: ${{ inputs.cache }}
+          CCACHE: ${{ inputs.ccache }}
+          CCACHE_MAX: ${{ inputs.ccache-max-size }}
+          JVMARGS: ${{ inputs.gradle-jvmargs }}
+        run: |
+          set -euo pipefail
+
+          if [ "$PLATFORM" = "android" ]; then
+            # Gradle project properties can be set through ORG_GRADLE_PROJECT_* env vars,
+            # which reach the app and every library module.
+            if [ -n "$ARCHS" ]; then
+              echo "ORG_GRADLE_PROJECT_reactNativeArchitectures=$ARCHS" >> "$GITHUB_ENV"
+              echo "Building ABIs: $ARCHS"
+            fi
+
+            # User-level gradle.properties applies to every build without touching the
+            # project (which would change its fingerprint). EAS cloud does the same.
+            mkdir -p ~/.gradle
+            if [ "$CACHE" = "true" ]; then
+              printf '\norg.gradle.caching=true\n' >> ~/.gradle/gradle.properties
+              echo "Enabled the Gradle build cache"
+            fi
+            if [ -n "$JVMARGS" ]; then
+              printf '\norg.gradle.jvmargs=%s\n' "$JVMARGS" >> ~/.gradle/gradle.properties
+              echo "org.gradle.jvmargs=$JVMARGS"
+            fi
+          fi
+
+          if [ "$CCACHE" = "true" ]; then
+            if [ "$RUNNER_OS" = "macOS" ]; then
+              CCACHE_DIR="$HOME/Library/Caches/ccache"
+            else
+              CCACHE_DIR="$HOME/.cache/ccache"
+            fi
+            mkdir -p "$CCACHE_DIR"
+            {
+              echo "CCACHE_DIR=$CCACHE_DIR"
+              echo "CCACHE_MAXSIZE=$CCACHE_MAX"
+              # EAS builds in a fixed folder under RUNNER_TEMP; make paths inside it
+              # relative so hits don't depend on where the runner put it.
+              echo "CCACHE_BASEDIR=$RUNNER_TEMP/eas-build"
+              # RelWithDebInfo compiles with -g, which otherwise hashes the working dir.
+              echo "CCACHE_NOHASHDIR=true"
+              echo "CCACHE_COMPILERCHECK=content"
+              echo "CCACHE_SLOPPINESS=pch_defines,time_macros,include_file_mtime,include_file_ctime"
+            } >> "$GITHUB_ENV"
+            if [ "$PLATFORM" = "android" ]; then
+              # CMake reads these as the default compiler launcher for every project,
+              # including library modules React Native's own ccache hook doesn't cover.
+              echo "CMAKE_C_COMPILER_LAUNCHER=ccache" >> "$GITHUB_ENV"
+              echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache" >> "$GITHUB_ENV"
+            else
+              # React Native's pod setup routes compilation through ccache when set.
+              echo "USE_CCACHE=1" >> "$GITHUB_ENV"
+            fi
+            CCACHE_DIR="$CCACHE_DIR" ccache --zero-stats >/dev/null
+            echo "ccache enabled ($CCACHE_DIR, max $CCACHE_MAX)"
+          fi
 
       - name: Install Dependencies
         if: ${{ steps.pm.outputs.install != '' }}
@@ -685,8 +838,11 @@ jobs:
           fi
 
           echo "::group::eas ${args[*]}"
+          BUILD_START=$(date +%s)
           eas "${args[@]}"
+          BUILD_SECONDS=$(( $(date +%s) - BUILD_START ))
           echo "::endgroup::"
+          echo "seconds=$BUILD_SECONDS" >> "$GITHUB_OUTPUT"
 
           # Pick up the binary EAS produced (apk / aab / ipa, or tar.gz for simulator builds).
           FILE="$(find "$EAS_LOCAL_BUILD_ARTIFACTS_DIR" -maxdepth 1 -type f \
@@ -728,6 +884,49 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
           echo "::notice title=Build complete::$NAME.$TYPE ($SIZE)"
+
+      - name: Collect Cache Stats
+        id: cache-stats
+        if: ${{ always() && steps.build.outcome != 'skipped' }}
+        env:
+          CCACHE: ${{ inputs.ccache }}
+        run: |
+          size() { [ -d "$1" ] && du -sh "$1" 2>/dev/null | cut -f1 || echo "-"; }
+          {
+            echo "gradle=$(size ~/.gradle/caches)"
+            echo "gradle-build-cache=$(size ~/.gradle/caches/build-cache-1)"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$CCACHE" = "true" ] && command -v ccache >/dev/null 2>&1; then
+            # Hit rate for this run only (stats were zeroed before the build).
+            STATS="$(ccache --print-stats 2>/dev/null || true)"
+            stat() { echo "$STATS" | awk -v k="$1" '$1 == k {v = $2} END {print v + 0}'; }
+            HITS=$(( $(stat direct_cache_hit) + $(stat preprocessed_cache_hit) ))
+            MISSES=$(stat cache_miss)
+            TOTAL=$(( HITS + MISSES ))
+            RATE="-"
+            [ "$TOTAL" -gt 0 ] && RATE="$(( HITS * 100 / TOTAL ))%"
+            {
+              echo "ccache-hits=$HITS"
+              echo "ccache-total=$TOTAL"
+              echo "ccache-rate=$RATE"
+              echo "ccache-size=$(size "$CCACHE_DIR")"
+            } >> "$GITHUB_OUTPUT"
+            echo "::group::ccache stats"
+            ccache --show-stats || true
+            echo "::endgroup::"
+            if [ "$TOTAL" -eq 0 ]; then
+              echo "::warning title=ccache saw no compilations::ccache is enabled but no C/C++ compile went through it. The build may not honour CMAKE_*_COMPILER_LAUNCHER (Android) or USE_CCACHE (iOS)."
+            fi
+          fi
+          echo "Gradle caches: $(size ~/.gradle/caches) (build cache $(size ~/.gradle/caches/build-cache-1))"
+
+      - name: Save ccache
+        if: ${{ always() && inputs.ccache == 'true' && steps.config.outputs.cache-read-only != 'true' && steps.build.outcome != 'skipped' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.os == 'macOS' && '~/Library/Caches/ccache' || '~/.cache/ccache' }}
+          key: ${{ runner.os }}-ccache-${{ inputs.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Upload Artifact
         id: upload
@@ -774,7 +973,20 @@ jobs:
           RELEASE_URL: ${{ steps.release.outputs.url }}
           SUBMITTED: ${{ steps.submit.outcome == 'success' }}
           SHA: ${{ steps.config.outputs.sha }}
+          STARTED: ${{ steps.config.outputs.started }}
+          BUILD_SECONDS: ${{ steps.build.outputs.seconds }}
+          ARCHS: ${{ steps.config.outputs.archs }}
+          PLATFORM: ${{ inputs.platform }}
+          CACHE_READ_ONLY: ${{ steps.config.outputs.cache-read-only }}
+          GRADLE_SIZE: ${{ steps.cache-stats.outputs.gradle }}
+          GRADLE_BUILD_CACHE: ${{ steps.cache-stats.outputs.gradle-build-cache }}
+          CCACHE_RATE: ${{ steps.cache-stats.outputs.ccache-rate }}
+          CCACHE_HITS: ${{ steps.cache-stats.outputs.ccache-hits }}
+          CCACHE_TOTAL: ${{ steps.cache-stats.outputs.ccache-total }}
+          CCACHE_SIZE: ${{ steps.cache-stats.outputs.ccache-size }}
         run: |
+          fmt() { printf '%dm %02ds' $(( $1 / 60 )) $(( $1 % 60 )); }
+          TOTAL_SECONDS=$(( $(date +%s) - STARTED ))
           {
             echo "### 📦 $NAME build"
             echo ""
@@ -787,6 +999,17 @@ jobs:
             [ -n "$RELEASE_URL" ] && echo "| **Release** | $RELEASE_URL |"
             [ "$SUBMITTED" = "true" ] && echo "| **Store** | Submitted with \`eas submit\` |"
             echo "| **Commit** | \`${SHA:0:7}\` |"
+            echo ""
+            echo "#### ⏱️ Performance"
+            echo ""
+            echo "| | |"
+            echo "| :-- | :-- |"
+            echo "| **eas build** | $(fmt "${BUILD_SECONDS:-0}") |"
+            echo "| **Whole job** | $(fmt "$TOTAL_SECONDS") (so far) |"
+            [ "$PLATFORM" = "android" ] && echo "| **ABIs** | ${ARCHS:-project default} |"
+            [ "$PLATFORM" = "android" ] && echo "| **Gradle caches** | $GRADLE_SIZE (build cache $GRADLE_BUILD_CACHE) |"
+            [ -n "$CCACHE_RATE" ] && echo "| **ccache** | $CCACHE_RATE hit rate ($CCACHE_HITS / $CCACHE_TOTAL compilations), $CCACHE_SIZE |"
+            echo "| **Caches saved** | $([ "$CACHE_READ_ONLY" = "true" ] && echo "no (restore only, see \`cache-read-only\`)" || echo "yes") |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Report EAS CLI Fallback
