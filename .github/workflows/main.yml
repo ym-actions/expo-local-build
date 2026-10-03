@@ -1,0 +1,849 @@
+name: Expo Local Build
+
+on:
+  workflow_call:
+    inputs:
+      # ── What to build ───────────────────────────────────────────────────────
+      profile:
+        description: "EAS build profile from eas.json (e.g. development, preview, production)"
+        required: false
+        default: "production"
+        type: string
+      platform:
+        description: "Platform to build: 'android' or 'ios' (iOS needs a macOS runner)"
+        required: false
+        default: "android"
+        type: string
+      working-directory:
+        description: "Directory containing the Expo app (useful for monorepos)"
+        required: false
+        default: "."
+        type: string
+      build-args:
+        description: "Extra arguments appended to eas build (e.g. --clear-cache)"
+        required: false
+        default: ""
+        type: string
+      environment:
+        description: "GitHub environment to run the job in (enables environment secrets and protection rules)"
+        required: false
+        default: ""
+        type: string
+
+      # ── Build environment ───────────────────────────────────────────────────
+      env:
+        description: "Extra build-time environment variables, one KEY=VALUE per line (non-secret)"
+        required: false
+        default: ""
+        type: string
+      doppler-project:
+        description: "Doppler project to load secrets from. Not needed with a service token (it is scoped to one config)"
+        required: false
+        default: ""
+        type: string
+      doppler-config:
+        description: "Doppler config to load secrets from. Not needed with a service token (it is scoped to one config)"
+        required: false
+        default: ""
+        type: string
+      public-env-pattern:
+        description: "Regex of variable names whose values are NOT masked in logs (they ship inside the app anyway)"
+        required: false
+        default: "^EXPO_PUBLIC_"
+        type: string
+
+      # ── Toolchain ───────────────────────────────────────────────────────────
+      node-version:
+        description: "Node version to use. 'auto' reads .nvmrc / .node-version, falling back to the latest LTS"
+        required: false
+        default: "auto"
+        type: string
+      package-manager:
+        description: "Package manager: 'auto' (detected from packageManager field or lockfile), 'npm', 'pnpm', 'yarn' or 'bun'"
+        required: false
+        default: "auto"
+        type: string
+      install-command:
+        description: "Command to install dependencies. 'auto' uses the detected package manager, 'none' skips it"
+        required: false
+        default: "auto"
+        type: string
+      java-version:
+        description: "JDK version for Android builds"
+        required: false
+        default: "17"
+        type: string
+      eas-cli-version:
+        description: "Version of eas-cli to install globally (ignored when a local eas-cli is used)"
+        required: false
+        default: "latest"
+        type: string
+      use-local-cli:
+        description: "Use the eas-cli from the project's own dependencies (node_modules/.bin) instead of installing it globally. Falls back to a global install, with a warning, if it is not found"
+        required: false
+        default: "false"
+        type: string
+      cache:
+        description: "Cache package manager downloads and Gradle / CocoaPods files between runs"
+        required: false
+        default: "true"
+        type: string
+      free-disk-space:
+        description: "On Linux runners, delete preinstalled toolchains the build doesn't need (.NET, Haskell, CodeQL, …) to make room for native builds"
+        required: false
+        default: "true"
+        type: string
+
+      # ── What to do with the build ───────────────────────────────────────────
+      upload-artifact:
+        description: "Upload the binary as a workflow artifact"
+        required: false
+        default: "true"
+        type: string
+      artifact-name:
+        description: "Artifact and file name (without extension). 'auto' gives <slug>-<profile>-<version>-<sha>"
+        required: false
+        default: "auto"
+        type: string
+      retention-days:
+        description: "Days to keep the uploaded artifact (0 uses the repository default)"
+        required: false
+        default: 14
+        type: number
+      github-release:
+        description: "Attach the binary to a GitHub Release: 'auto' (only when triggered by a tag), 'true' or 'false'. Needs contents: write"
+        required: false
+        default: "false"
+        type: string
+      release-tag:
+        description: "Tag of the release to attach to (defaults to the triggering tag)"
+        required: false
+        default: ""
+        type: string
+      submit:
+        description: "Submit the binary to the store with eas submit after building (runs on EAS servers)"
+        required: false
+        default: "false"
+        type: string
+      submit-profile:
+        description: "Submit profile from eas.json (defaults to the build profile)"
+        required: false
+        default: ""
+        type: string
+
+      # ── Reporting ───────────────────────────────────────────────────────────
+      comment-on-pr:
+        description: "Post/update a sticky PR comment with a link to the build (and failures). Needs pull-requests: write"
+        required: false
+        default: "true"
+        type: string
+      build-name:
+        description: "Label used in the job name, comments and summary (defaults to '<Platform> <profile>')"
+        required: false
+        default: ""
+        type: string
+
+      # ── Runner & checkout ───────────────────────────────────────────────────
+      runs-on:
+        description: "Runner label. 'auto' uses ubuntu-latest for Android and macos-latest for iOS"
+        required: false
+        default: "auto"
+        type: string
+      timeout-minutes:
+        description: "Job timeout in minutes"
+        required: false
+        default: 90
+        type: number
+      ref:
+        description: "Git ref to check out (defaults to the ref that triggered the workflow)"
+        required: false
+        default: ""
+        type: string
+      submodules:
+        description: "Check out submodules: 'false', 'true' or 'recursive'"
+        required: false
+        default: "false"
+        type: string
+
+    secrets:
+      EXPO_TOKEN:
+        description: "Expo access token (expo.dev → Account settings → Access tokens)"
+        required: false
+      DOPPLER_TOKEN:
+        description: "Doppler token. A service token loads its config; a personal or service-account token also needs doppler-project and doppler-config"
+        required: false
+      BUILD_ENV:
+        description: "Secret build-time environment variables, one KEY=VALUE per line (values are masked in logs)"
+        required: false
+
+    outputs:
+      artifact-path:
+        description: "Path of the built binary on the runner (relative to the workspace)"
+        value: ${{ jobs.build.outputs.artifact-path }}
+      artifact-name:
+        description: "Name of the uploaded workflow artifact"
+        value: ${{ jobs.build.outputs.artifact-name }}
+      artifact-url:
+        description: "Download URL of the uploaded workflow artifact"
+        value: ${{ jobs.build.outputs.artifact-url }}
+      build-type:
+        description: "File type of the binary: apk, aab, ipa or tar.gz (iOS simulator)"
+        value: ${{ jobs.build.outputs.build-type }}
+      app-version:
+        description: "App version from the Expo config"
+        value: ${{ jobs.build.outputs.app-version }}
+      release-url:
+        description: "URL of the GitHub Release the binary was attached to"
+        value: ${{ jobs.build.outputs.release-url }}
+
+jobs:
+  build:
+    name: Build ${{ inputs.build-name || format('{0} {1}', inputs.platform, inputs.profile) }}
+    runs-on: ${{ inputs.runs-on != 'auto' && inputs.runs-on || (inputs.platform == 'ios' && 'macos-latest' || 'ubuntu-latest') }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    environment: ${{ inputs.environment }}
+
+    # No permissions block: the job inherits whatever the caller grants, so
+    # optional features (PR comments, releases) don't force extra permissions.
+
+    # One build per platform + profile + PR/branch at a time. Superseded PR builds
+    # are cancelled; other builds are queued instead of being interrupted.
+    concurrency:
+      group: expo-local-build-${{ inputs.platform }}-${{ inputs.profile }}-${{ inputs.working-directory }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_target' }}
+
+    env:
+      # Never block on corepack's "download pnpm/yarn?" confirmation in CI.
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+      EXPO_NO_TELEMETRY: "1"
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+
+    outputs:
+      artifact-path: ${{ steps.build.outputs.path }}
+      artifact-name: ${{ steps.build.outputs.name }}
+      artifact-url: ${{ steps.upload.outputs.artifact-url }}
+      build-type: ${{ steps.build.outputs.type }}
+      app-version: ${{ steps.build.outputs.version }}
+      release-url: ${{ steps.release.outputs.url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          submodules: ${{ inputs.submodules }}
+
+      - name: Resolve Configuration
+        id: config
+        env:
+          HAS_EXPO_TOKEN: ${{ secrets.EXPO_TOKEN != '' }}
+          HAS_DOPPLER_TOKEN: ${{ secrets.DOPPLER_TOKEN != '' }}
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork == true }}
+          PLATFORM: ${{ inputs.platform }}
+          PROFILE: ${{ inputs.profile }}
+          INPUT_NODE_VERSION: ${{ inputs.node-version }}
+          INPUT_BUILD_NAME: ${{ inputs.build-name }}
+          INPUT_RELEASE: ${{ inputs.github-release }}
+          INPUT_RELEASE_TAG: ${{ inputs.release-tag }}
+          DOPPLER_PROJECT: ${{ inputs.doppler-project }}
+          DOPPLER_CONFIG: ${{ inputs.doppler-config }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # ── Credentials ──────────────────────────────────────────────────
+          if [ "$HAS_EXPO_TOKEN" != "true" ]; then
+            echo "::error title=Missing EXPO_TOKEN::Pass the EXPO_TOKEN secret to this workflow (see README). Local builds still need it to fetch credentials and app versions from EAS."
+            if [ "$IS_FORK" = "true" ]; then
+              echo "::error::This pull request comes from a fork, so repository secrets are not available to it."
+            fi
+            exit 1
+          fi
+          if { [ -n "$DOPPLER_PROJECT" ] || [ -n "$DOPPLER_CONFIG" ]; } && [ "$HAS_DOPPLER_TOKEN" != "true" ]; then
+            echo "::error title=Missing DOPPLER_TOKEN::doppler-project / doppler-config are set but no DOPPLER_TOKEN secret was passed."
+            exit 1
+          fi
+
+          # ── Platform & profile ───────────────────────────────────────────
+          case "$PLATFORM" in
+            android|ios) ;;
+            *) echo "::error::platform must be 'android' or 'ios' (got '$PLATFORM'). Call the workflow once per platform to build both."; exit 1 ;;
+          esac
+          if [ "$PLATFORM" = "ios" ] && [ "$RUNNER_OS" != "macOS" ]; then
+            echo "::error title=iOS needs macOS::iOS builds need a macOS runner (got $RUNNER_OS). Leave runs-on as 'auto' or set it to a macOS label."
+            exit 1
+          fi
+          if [ ! -f eas.json ]; then
+            echo "::error title=eas.json not found::No eas.json in '$PWD'. Check working-directory."
+            exit 1
+          fi
+          if ! jq -e --arg p "$PROFILE" '.build[$p]' eas.json >/dev/null; then
+            echo "::error title=Unknown profile::eas.json has no build profile '$PROFILE'. Available: $(jq -r '.build | keys | join(", ")' eas.json)"
+            exit 1
+          fi
+
+          # ── Labels ───────────────────────────────────────────────────────
+          case "$PLATFORM" in android) PLATFORM_LABEL=Android ;; ios) PLATFORM_LABEL=iOS ;; esac
+          BUILD_NAME="${INPUT_BUILD_NAME:-$PLATFORM_LABEL $PROFILE}"
+          SHA="${PR_HEAD_SHA:-$GITHUB_SHA}"
+
+          # ── GitHub Release ───────────────────────────────────────────────
+          RELEASE_TAG=""
+          case "$INPUT_RELEASE" in
+            false) ;;
+            true|auto)
+              if [ -n "$INPUT_RELEASE_TAG" ]; then
+                RELEASE_TAG="$INPUT_RELEASE_TAG"
+              elif [ "$GITHUB_REF_TYPE" = "tag" ]; then
+                RELEASE_TAG="$GITHUB_REF_NAME"
+              elif [ "$INPUT_RELEASE" = "true" ]; then
+                echo "::error::github-release is 'true' but this run wasn't triggered by a tag. Set release-tag, or use 'auto'."
+                exit 1
+              fi
+              ;;
+            *) echo "::error::github-release must be 'auto', 'true' or 'false' (got '$INPUT_RELEASE')"; exit 1 ;;
+          esac
+
+          # ── Node version ─────────────────────────────────────────────────
+          NODE_VERSION=""
+          NODE_VERSION_FILE=""
+          if [ "$INPUT_NODE_VERSION" = "auto" ]; then
+            for f in .nvmrc .node-version "$GITHUB_WORKSPACE/.nvmrc" "$GITHUB_WORKSPACE/.node-version"; do
+              if [ -f "$f" ]; then
+                ABS="$(cd "$(dirname "$f")" && pwd)/$(basename "$f")"
+                NODE_VERSION_FILE="${ABS#"$GITHUB_WORKSPACE"/}"
+                break
+              fi
+            done
+            [ -z "$NODE_VERSION_FILE" ] && NODE_VERSION="lts/*"
+          else
+            NODE_VERSION="$INPUT_NODE_VERSION"
+          fi
+
+          {
+            echo "build-name=$BUILD_NAME"
+            echo "doppler=$HAS_DOPPLER_TOKEN"
+            echo "sha=$SHA"
+            echo "release-tag=$RELEASE_TAG"
+            echo "node-version=$NODE_VERSION"
+            echo "node-version-file=$NODE_VERSION_FILE"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Build:        $BUILD_NAME (profile '$PROFILE', $PLATFORM)"
+          echo "Runner:       $RUNNER_OS"
+          echo "Release tag:  ${RELEASE_TAG:-<none>}"
+          echo "Node version: ${NODE_VERSION:-from $NODE_VERSION_FILE}"
+
+      - name: Free Disk Space
+        if: ${{ inputs.free-disk-space == 'true' && runner.os == 'Linux' }}
+        working-directory: /
+        run: |
+          # Native Android builds for all ABIs can outgrow the default free space.
+          # Keep the Android SDK, Java and Node; drop toolchains this build never uses.
+          echo "Free before: $(df -h / | awk 'NR==2 {print $4}')"
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost /usr/local/lib/node_modules/@angular /usr/share/swift || true
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          echo "Free after:  $(df -h / | awk 'NR==2 {print $4}')"
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ steps.config.outputs.node-version }}
+          node-version-file: ${{ steps.config.outputs.node-version-file }}
+          # setup-node v5 auto-enables caching from the packageManager field, which
+          # calls pnpm/yarn before they are installed. Caching is handled below.
+          package-manager-cache: false
+
+      - name: Detect Package Manager
+        id: pm
+        env:
+          INPUT_PM: ${{ inputs.package-manager }}
+          INPUT_INSTALL: ${{ inputs.install-command }}
+        run: |
+          set -euo pipefail
+
+          # Find the nearest file walking up from working-directory to the repo root.
+          find_up() {
+            local dir="$PWD"
+            while :; do
+              [ -f "$dir/$1" ] && { echo "$dir/$1"; return 0; }
+              { [ "$dir" = "$GITHUB_WORKSPACE" ] || [ "$dir" = "/" ]; } && return 1
+              dir="$(dirname "$dir")"
+            done
+          }
+
+          # ── Package manager ──────────────────────────────────────────────
+          # The packageManager field usually lives in the monorepo root, so keep
+          # walking up until a package.json that declares it is found.
+          PM_SPEC=""
+          DIR="$PWD"
+          while :; do
+            if [ -f "$DIR/package.json" ]; then
+              PM_SPEC="$(PKG="$DIR/package.json" node -p "require(process.env.PKG).packageManager || ''")"
+              [ -n "$PM_SPEC" ] && break
+            fi
+            { [ "$DIR" = "$GITHUB_WORKSPACE" ] || [ "$DIR" = "/" ]; } && break
+            DIR="$(dirname "$DIR")"
+          done
+
+          if [ "$INPUT_PM" != "auto" ]; then
+            PM="$INPUT_PM"
+          elif [ -n "$PM_SPEC" ]; then
+            PM="${PM_SPEC%%@*}"
+          elif find_up bun.lock >/dev/null || find_up bun.lockb >/dev/null; then
+            PM=bun
+          elif find_up pnpm-lock.yaml >/dev/null; then
+            PM=pnpm
+          elif find_up yarn.lock >/dev/null; then
+            PM=yarn
+          else
+            PM=npm
+          fi
+
+          case "$PM" in
+            npm|pnpm|yarn|bun) ;;
+            *) echo "::error::Unsupported package manager '$PM' (expected npm, pnpm, yarn or bun)"; exit 1 ;;
+          esac
+
+          # Make pnpm / yarn available (bun is installed by a dedicated step).
+          # EAS runs its own install inside the build, so it must be on PATH either way.
+          if [ "$PM" = "pnpm" ] || [ "$PM" = "yarn" ]; then
+            if [ -n "$PM_SPEC" ] && [ "${PM_SPEC%%@*}" = "$PM" ] && corepack enable 2>/dev/null; then
+              echo "Enabled $PM_SPEC via corepack"
+            elif ! command -v "$PM" >/dev/null 2>&1; then
+              echo "Installing $PM globally..."
+              SPEC="$PM"
+              [ "${PM_SPEC%%@*}" = "$PM" ] && SPEC="${PM_SPEC%%+*}"
+              npm install -g "$SPEC" --no-fund --no-audit
+            fi
+          fi
+
+          # ── Cache directory ──────────────────────────────────────────────
+          case "$PM" in
+            npm)  CACHE_DIR="$(npm config get cache)" ;;
+            pnpm) CACHE_DIR="$(pnpm store path --silent)" ;;
+            yarn)
+              if [ "$(yarn --version | cut -d. -f1)" -ge 2 ]; then
+                CACHE_DIR="$(yarn config get cacheFolder)"
+              else
+                CACHE_DIR="$(yarn cache dir)"
+              fi
+              ;;
+            bun)  CACHE_DIR="$HOME/.bun/install/cache" ;;
+          esac
+
+          # ── Install command ──────────────────────────────────────────────
+          # eas-cli reads the app config (app.config.ts, config plugins), which
+          # needs the project's dependencies installed.
+          case "$INPUT_INSTALL" in
+            none|"") INSTALL="" ;;
+            auto)
+              case "$PM" in
+                npm)
+                  if find_up package-lock.json >/dev/null || find_up npm-shrinkwrap.json >/dev/null; then
+                    INSTALL="npm ci"
+                  else
+                    INSTALL="npm install"
+                  fi
+                  ;;
+                pnpm) INSTALL="pnpm install --frozen-lockfile" ;;
+                yarn)
+                  if [ "$(yarn --version | cut -d. -f1)" -ge 2 ]; then
+                    INSTALL="yarn install --immutable"
+                  else
+                    INSTALL="yarn install --frozen-lockfile"
+                  fi
+                  ;;
+                bun) INSTALL="bun install --frozen-lockfile" ;;
+              esac
+              ;;
+            *) INSTALL="$INPUT_INSTALL" ;;
+          esac
+
+          {
+            echo "name=$PM"
+            echo "cache-dir=$CACHE_DIR"
+            echo "install=$INSTALL"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Package manager: $PM${PM_SPEC:+ ($PM_SPEC)}"
+          echo "Install:         ${INSTALL:-<skipped>}"
+
+      - name: Setup Bun
+        if: ${{ steps.pm.outputs.name == 'bun' }}
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup Java
+        if: ${{ inputs.platform == 'android' }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: zulu
+          java-version: ${{ inputs.java-version }}
+
+      - name: Check Android SDK
+        id: android-sdk
+        if: ${{ inputs.platform == 'android' }}
+        run: |
+          if [ -n "${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}" ] && [ -d "${ANDROID_HOME:-$ANDROID_SDK_ROOT}" ]; then
+            echo "Android SDK found at ${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+            echo "missing=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "No Android SDK on this runner, installing it."
+            echo "missing=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Android SDK
+        if: ${{ steps.android-sdk.outputs.missing == 'true' }}
+        uses: android-actions/setup-android@v3
+
+      - name: Cache Dependencies
+        if: ${{ inputs.cache == 'true' && steps.pm.outputs.install != '' }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pm.outputs.cache-dir }}
+          key: ${{ runner.os }}-${{ steps.pm.outputs.name }}-${{ hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json', '**/pnpm-lock.yaml', '**/yarn.lock', '**/bun.lock', '**/bun.lockb') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ steps.pm.outputs.name }}-
+
+      - name: Cache Gradle
+        if: ${{ inputs.cache == 'true' && inputs.platform == 'android' }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ inputs.profile }}-${{ hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json', '**/pnpm-lock.yaml', '**/yarn.lock', '**/bun.lock', '**/bun.lockb') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-${{ inputs.profile }}-
+            ${{ runner.os }}-gradle-
+
+      - name: Cache CocoaPods
+        if: ${{ inputs.cache == 'true' && inputs.platform == 'ios' }}
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/CocoaPods
+          key: ${{ runner.os }}-pods-${{ hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json', '**/pnpm-lock.yaml', '**/yarn.lock', '**/bun.lock', '**/bun.lockb') }}
+          restore-keys: |
+            ${{ runner.os }}-pods-
+
+      - name: Setup Doppler CLI
+        if: ${{ steps.config.outputs.doppler == 'true' }}
+        uses: dopplerhq/cli-action@v3
+
+      - name: Load Build Environment
+        env:
+          PLAIN_ENV: ${{ inputs.env }}
+          SECRET_ENV: ${{ secrets.BUILD_ENV }}
+          DOPPLER_TOKEN: ${{ secrets.DOPPLER_TOKEN }}
+          DOPPLER_PROJECT: ${{ inputs.doppler-project }}
+          DOPPLER_CONFIG: ${{ inputs.doppler-config }}
+          PUBLIC_PATTERN: ${{ inputs.public-env-pattern }}
+        run: |
+          set -euo pipefail
+
+          # export_var SOURCE MASK KEY VALUE -> available to every later step.
+          export_var() {
+            local source="$1" mask="$2" key="$3" value="$4" delim
+            if [ "$mask" = "true" ] && [ -n "$value" ]; then
+              if [ -z "$PUBLIC_PATTERN" ] || ! [[ "$key" =~ $PUBLIC_PATTERN ]]; then
+                # Mask each line separately so multi-line values (keys, JSON) stay hidden.
+                while IFS= read -r part; do
+                  [ -n "$part" ] && echo "::add-mask::$part"
+                done <<< "$value"
+              fi
+            fi
+            delim="EOF_$(openssl rand -hex 8)"
+            printf '%s<<%s\n%s\n%s\n' "$key" "$delim" "$value" "$delim" >> "$GITHUB_ENV"
+            echo "Loaded $key from $source"
+          }
+
+          # Parse KEY=VALUE lines.
+          load_env() {
+            local source="$1" mask="$2" content="$3" line key value
+            [ -z "$content" ] && return 0
+            while IFS= read -r line || [ -n "$line" ]; do
+              line="${line%$'\r'}"
+              [[ -z "${line// }" || "$line" =~ ^[[:space:]]*# ]] && continue
+              line="${line#export }"
+              if [[ ! "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+                echo "::error::Invalid line in $source (expected KEY=VALUE)"
+                exit 1
+              fi
+              key="${BASH_REMATCH[1]}"
+              value="${BASH_REMATCH[2]}"
+              # Strip one pair of matching surrounding quotes.
+              if [[ "$value" =~ ^\"(.*)\"$ || "$value" =~ ^\'(.*)\'$ ]]; then
+                value="${BASH_REMATCH[1]}"
+              fi
+              export_var "$source" "$mask" "$key" "$value"
+            done <<< "$content"
+          }
+
+          # Later sources override earlier ones: Doppler < env input < BUILD_ENV.
+          if [ -n "$DOPPLER_TOKEN" ]; then
+            args=(secrets download --no-file --format json)
+            [ -n "$DOPPLER_PROJECT" ] && args+=(--project "$DOPPLER_PROJECT")
+            [ -n "$DOPPLER_CONFIG" ] && args+=(--config "$DOPPLER_CONFIG")
+            JSON="$(doppler "${args[@]}")"
+            echo "Doppler: $(echo "$JSON" | jq -r '"\(.DOPPLER_PROJECT // "?") / \(.DOPPLER_CONFIG // "?")"')"
+            while IFS= read -r key; do
+              # Doppler's own metadata (project/config names) isn't secret.
+              if [[ "$key" == DOPPLER_* ]]; then mask=false; else mask=true; fi
+              export_var "Doppler" "$mask" "$key" "$(echo "$JSON" | jq -r --arg k "$key" '.[$k]')"
+            done < <(echo "$JSON" | jq -r 'keys[]')
+          fi
+          load_env "env input" false "$PLAIN_ENV"
+          load_env "BUILD_ENV secret" true "$SECRET_ENV"
+
+      - name: Install Dependencies
+        if: ${{ steps.pm.outputs.install != '' }}
+        env:
+          INSTALL_COMMAND: ${{ steps.pm.outputs.install }}
+        run: bash -c "$INSTALL_COMMAND"
+
+      - name: Set Up EAS CLI
+        id: cli
+        env:
+          CLI_VERSION: ${{ inputs.eas-cli-version }}
+          USE_LOCAL: ${{ inputs.use-local-cli }}
+          PM: ${{ steps.pm.outputs.name }}
+        run: |
+          set -euo pipefail
+
+          # Look for a locally installed CLI, walking up to the repo root so that
+          # hoisted monorepo dependencies are found too.
+          LOCAL_BIN=""
+          if [ "$USE_LOCAL" = "true" ]; then
+            DIR="$PWD"
+            while :; do
+              if [ -x "$DIR/node_modules/.bin/eas" ]; then
+                LOCAL_BIN="$DIR/node_modules/.bin"
+                break
+              fi
+              { [ "$DIR" = "$GITHUB_WORKSPACE" ] || [ "$DIR" = "/" ]; } && break
+              DIR="$(dirname "$DIR")"
+            done
+          fi
+
+          if [ -n "$LOCAL_BIN" ]; then
+            echo "$LOCAL_BIN" >> "$GITHUB_PATH"
+            export PATH="$LOCAL_BIN:$PATH"
+            echo "source=local" >> "$GITHUB_OUTPUT"
+            echo "Using local eas-cli from $LOCAL_BIN"
+            [ "$CLI_VERSION" != "latest" ] && echo "::notice::eas-cli-version is ignored because the local eas-cli is used."
+          else
+            if [ "$USE_LOCAL" = "true" ]; then
+              case "$PM" in
+                pnpm) ADD="pnpm add -D eas-cli" ;;
+                yarn) ADD="yarn add -D eas-cli" ;;
+                bun)  ADD="bun add -d eas-cli" ;;
+                *)    ADD="npm install --save-dev eas-cli" ;;
+              esac
+              echo "source=global-fallback" >> "$GITHUB_OUTPUT"
+              echo "install-hint=$ADD" >> "$GITHUB_OUTPUT"
+              echo "::warning title=eas-cli not found locally::use-local-cli is enabled but eas-cli is not in node_modules/.bin, so it is being installed globally (slower). Add it to your project: $ADD"
+            else
+              echo "source=global" >> "$GITHUB_OUTPUT"
+            fi
+            npm install -g "eas-cli@$CLI_VERSION" --no-fund --no-audit
+          fi
+          eas --version
+
+      - name: Build
+        id: build
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          PLATFORM: ${{ inputs.platform }}
+          PROFILE: ${{ inputs.profile }}
+          BUILD_ARGS: ${{ inputs.build-args }}
+          INPUT_ARTIFACT_NAME: ${{ inputs.artifact-name }}
+          SHA: ${{ steps.config.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          # Read slug and version for naming. Never fatal: naming falls back to the repo.
+          CONFIG="$(npx --no-install expo config --json --type public 2>/dev/null || echo '{}')"
+          SLUG="$(echo "$CONFIG" | jq -r '.slug // empty' 2>/dev/null || true)"
+          VERSION="$(echo "$CONFIG" | jq -r '.version // empty' 2>/dev/null || true)"
+          SLUG="${SLUG:-${GITHUB_REPOSITORY#*/}}"
+
+          # Build outside the workspace so nothing leaks into the checkout.
+          export EAS_LOCAL_BUILD_WORKINGDIR="$RUNNER_TEMP/eas-build"
+          export EAS_LOCAL_BUILD_ARTIFACTS_DIR="$RUNNER_TEMP/eas-artifacts"
+          mkdir -p "$EAS_LOCAL_BUILD_WORKINGDIR" "$EAS_LOCAL_BUILD_ARTIFACTS_DIR"
+
+          args=(build --local --non-interactive --platform "$PLATFORM" --profile "$PROFILE")
+          if [ -n "$BUILD_ARGS" ]; then
+            read -r -a extra <<< "$BUILD_ARGS"
+            args+=("${extra[@]}")
+          fi
+
+          echo "::group::eas ${args[*]}"
+          eas "${args[@]}"
+          echo "::endgroup::"
+
+          # Pick up the binary EAS produced (apk / aab / ipa, or tar.gz for simulator builds).
+          FILE="$(find "$EAS_LOCAL_BUILD_ARTIFACTS_DIR" -maxdepth 1 -type f \
+            \( -name '*.apk' -o -name '*.aab' -o -name '*.ipa' -o -name '*.tar.gz' \) \
+            -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n1 | cut -d' ' -f2- || true)"
+          if [ -z "$FILE" ]; then
+            # BSD find (macOS) has no -printf.
+            FILE="$(ls -t "$EAS_LOCAL_BUILD_ARTIFACTS_DIR"/*.{apk,aab,ipa,tar.gz} 2>/dev/null | head -n1 || true)"
+          fi
+          if [ -z "$FILE" ]; then
+            echo "::error title=No build output::eas build finished but no apk/aab/ipa/tar.gz was found in $EAS_LOCAL_BUILD_ARTIFACTS_DIR."
+            ls -la "$EAS_LOCAL_BUILD_ARTIFACTS_DIR"
+            exit 1
+          fi
+          case "$FILE" in
+            *.tar.gz) TYPE=tar.gz ;;
+            *) TYPE="${FILE##*.}" ;;
+          esac
+
+          slugify() { echo "$1" | sed -E 's/[^A-Za-z0-9._-]+/-/g; s/^-+//; s/-+$//'; }
+          if [ "$INPUT_ARTIFACT_NAME" = "auto" ] || [ -z "$INPUT_ARTIFACT_NAME" ]; then
+            NAME="$(slugify "$SLUG-$PROFILE${VERSION:+-$VERSION}-${SHA:0:7}")"
+          else
+            NAME="$(slugify "$INPUT_ARTIFACT_NAME")"
+          fi
+
+          OUT_DIR="$GITHUB_WORKSPACE/.expo-local-build"
+          mkdir -p "$OUT_DIR"
+          DEST="$OUT_DIR/$NAME.$TYPE"
+          mv "$FILE" "$DEST"
+          SIZE="$(du -h "$DEST" | cut -f1)"
+
+          {
+            echo "path=${DEST#"$GITHUB_WORKSPACE"/}"
+            echo "name=$NAME"
+            echo "type=$TYPE"
+            echo "version=$VERSION"
+            echo "size=$SIZE"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "::notice title=Build complete::$NAME.$TYPE ($SIZE)"
+
+      - name: Upload Artifact
+        id: upload
+        if: ${{ inputs.upload-artifact == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build.outputs.name }}
+          path: ${{ github.workspace }}/${{ steps.build.outputs.path }}
+          retention-days: ${{ inputs.retention-days }}
+          if-no-files-found: error
+          # Binaries are already compressed.
+          compression-level: 0
+
+      - name: Attach to GitHub Release
+        id: release
+        if: ${{ steps.config.outputs.release-tag != '' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.config.outputs.release-tag }}
+          files: ${{ github.workspace }}/${{ steps.build.outputs.path }}
+          fail_on_unmatched_files: true
+
+      - name: Submit to Store
+        id: submit
+        if: ${{ inputs.submit == 'true' }}
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          PLATFORM: ${{ inputs.platform }}
+          SUBMIT_PROFILE: ${{ inputs.submit-profile || inputs.profile }}
+          FILE: ${{ github.workspace }}/${{ steps.build.outputs.path }}
+        run: |
+          set -euo pipefail
+          eas submit --non-interactive --platform "$PLATFORM" --profile "$SUBMIT_PROFILE" --path "$FILE"
+
+      - name: Write Job Summary
+        if: ${{ always() && steps.build.outcome == 'success' }}
+        env:
+          NAME: ${{ steps.config.outputs.build-name }}
+          FILE_NAME: ${{ steps.build.outputs.name }}.${{ steps.build.outputs.type }}
+          SIZE: ${{ steps.build.outputs.size }}
+          VERSION: ${{ steps.build.outputs.version }}
+          PROFILE: ${{ inputs.profile }}
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+          RELEASE_URL: ${{ steps.release.outputs.url }}
+          SUBMITTED: ${{ steps.submit.outcome == 'success' }}
+          SHA: ${{ steps.config.outputs.sha }}
+        run: |
+          {
+            echo "### 📦 $NAME build"
+            echo ""
+            echo "| | |"
+            echo "| :-- | :-- |"
+            echo "| **File** | \`$FILE_NAME\` ($SIZE) |"
+            echo "| **Profile** | \`$PROFILE\` |"
+            [ -n "$VERSION" ] && echo "| **Version** | $VERSION |"
+            [ -n "$ARTIFACT_URL" ] && echo "| **Download** | [Workflow artifact]($ARTIFACT_URL) |"
+            [ -n "$RELEASE_URL" ] && echo "| **Release** | $RELEASE_URL |"
+            [ "$SUBMITTED" = "true" ] && echo "| **Store** | Submitted with \`eas submit\` |"
+            echo "| **Commit** | \`${SHA:0:7}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report EAS CLI Fallback
+        if: ${{ always() && steps.cli.outputs.source == 'global-fallback' }}
+        env:
+          HINT: ${{ steps.cli.outputs.install-hint }}
+        run: |
+          echo "::warning title=eas-cli was installed globally::use-local-cli is enabled but eas-cli was not found in the project's dependencies, so it was installed on every run. Install it locally to speed up builds: $HINT"
+          {
+            echo ""
+            echo "> [!WARNING]"
+            echo "> \`use-local-cli\` is enabled but \`eas-cli\` was not found in your project's dependencies, so it was installed globally on this run (slower)."
+            echo "> Install it locally and commit the updated lockfile:"
+            echo ">"
+            echo "> \`\`\`sh"
+            echo "> $HINT"
+            echo "> \`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Prepare PR Comment
+        id: comment
+        if: ${{ always() && github.event.pull_request.number && inputs.comment-on-pr == 'true' && steps.config.outcome == 'success' }}
+        env:
+          NAME: ${{ steps.config.outputs.build-name }}
+          OUTCOME: ${{ steps.build.outcome }}
+          FILE_NAME: ${{ steps.build.outputs.name }}.${{ steps.build.outputs.type }}
+          SIZE: ${{ steps.build.outputs.size }}
+          VERSION: ${{ steps.build.outputs.version }}
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+          SHA: ${{ steps.config.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          {
+            echo "body<<EOF_COMMENT"
+            if [ "$OUTCOME" = "success" ]; then
+              echo "### 📦 $NAME build is ready"
+              echo ""
+              echo "| | |"
+              echo "| :-- | :-- |"
+              if [ -n "$ARTIFACT_URL" ]; then
+                echo "| **Download** | [\`$FILE_NAME\`]($ARTIFACT_URL) ($SIZE) |"
+              else
+                echo "| **File** | \`$FILE_NAME\` ($SIZE) |"
+              fi
+              [ -n "$VERSION" ] && echo "| **Version** | $VERSION |"
+              echo "| **Commit** | \`${SHA:0:7}\` |"
+            else
+              echo "### ❌ $NAME build failed"
+              echo ""
+              echo "The build for commit \`${SHA:0:7}\` did not complete. [View workflow logs]($RUN_URL)."
+            fi
+            echo "EOF_COMMENT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post PR Comment
+        if: ${{ always() && steps.comment.outputs.body != '' }}
+        continue-on-error: true
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: expo-local-build-${{ inputs.platform }}-${{ inputs.profile }}-${{ inputs.working-directory }}
+          message: ${{ steps.comment.outputs.body }}
