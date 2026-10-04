@@ -182,7 +182,7 @@ See [Making Builds Faster](#-making-builds-faster) for how these fit together.
 | `cache-read-only`       | Restore the Gradle and ccache caches without saving them. `"auto"` saves only on the default branch.                | `"auto"`   |
 | `ccache`                | Compile C/C++ through [ccache](https://ccache.dev) and keep its cache between runs.                                 | `"false"`  |
 | `ccache-max-size`       | Maximum size of the ccache cache.                                                                                   | `"2G"`     |
-| `gradle-jvmargs`        | Override `org.gradle.jvmargs`, e.g. `"-Xmx6g -XX:MaxMetaspaceSize=1g"`. Empty keeps your project's value.          | `""`       |
+| `gradle-jvmargs`        | JVM args for Gradle. `"auto"` sizes the Gradle and Kotlin daemon heaps to the runner's RAM, with 1 GB of metaspace each. A custom value, e.g. `"-Xmx6g -XX:MaxMetaspaceSize=1g"`, sets `org.gradle.jvmargs`. `"project"` keeps your project's own settings. | `"auto"` |
 | `free-disk-space`       | On Linux, delete preinstalled toolchains the build doesn't use (.NET, Haskell, CodeQL, Swift, Docker images).       | `"true"`   |
 
 #### What to do with the build
@@ -289,14 +289,9 @@ The first run fills the cache and is slightly *slower*. Later runs with unchange
 > [!NOTE]
 > On iOS, if your Podfile passes `ccache_enabled:` to `react_native_post_install` explicitly, that value wins over `USE_CCACHE`. Enable it there, for example through `expo-build-properties` (`ios.ccacheEnabled`).
 
-### 4. Give Gradle more memory on big runners
+### 4. Gradle memory is sized for you
 
-Out-of-memory errors or very slow Kotlin compiles usually mean the Gradle daemon's heap is too small for the runner. With 16 GB of RAM (standard runners for public repositories):
-
-```yaml
-    with:
-      gradle-jvmargs: "-Xmx6g -XX:MaxMetaspaceSize=1g"
-```
+The Expo / React Native template sets `-Xmx2048m -XX:MaxMetaspaceSize=512m`. That's sized for a laptop, and on larger apps the Gradle or Kotlin daemon runs out of metaspace. The build then **hangs** instead of failing, with lines like `java.lang.OutOfMemoryError: Metaspace` repeating in the log. With the default `gradle-jvmargs: "auto"`, the workflow gives the Gradle daemon 40% of the runner's RAM (at most 8 GB) and the Kotlin daemon 25% (at most 4 GB), with 1 GB of metaspace each. The rest is left for the native compilers. Set a custom value to tune it, or `"project"` to use your own `gradle.properties`.
 
 ### Reading the performance report
 
@@ -422,6 +417,10 @@ jobs:
   build:
     if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request'
 ```
+
+### The build hangs with `OutOfMemoryError: Metaspace`
+
+Cancel it, because it won't recover. Make sure `gradle-jvmargs` is `"auto"` (the default) or a value with enough metaspace, e.g. `"-Xmx4g -XX:MaxMetaspaceSize=1g"`.
 
 ### "No space left on device"
 

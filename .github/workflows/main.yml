@@ -111,9 +111,9 @@ on:
         default: "2G"
         type: string
       gradle-jvmargs:
-        description: "Override org.gradle.jvmargs for the build (e.g. '-Xmx6g -XX:MaxMetaspaceSize=1g'). Empty keeps the project's value"
+        description: "JVM args for the Gradle and Kotlin daemons. 'auto' sizes the heap to the runner's RAM with 1 GB of metaspace (the project template's 512 MB runs out on larger apps); a custom value sets org.gradle.jvmargs; 'project' keeps the project's own settings"
         required: false
-        default: ""
+        default: "auto"
         type: string
       free-disk-space:
         description: "On Linux runners, delete preinstalled toolchains the build doesn't need (.NET, Haskell, CodeQL, …) to make room for native builds"
@@ -717,10 +717,34 @@ jobs:
               printf '\norg.gradle.caching=true\n' >> ~/.gradle/gradle.properties
               echo "Enabled the Gradle build cache"
             fi
-            if [ -n "$JVMARGS" ]; then
-              printf '\norg.gradle.jvmargs=%s\n' "$JVMARGS" >> ~/.gradle/gradle.properties
-              echo "org.gradle.jvmargs=$JVMARGS"
-            fi
+            # User-level properties win over the project's gradle.properties. The Expo/RN
+            # template's -Xmx2048m -XX:MaxMetaspaceSize=512m is sized for laptops building
+            # one ABI and runs out of metaspace (and hangs) on larger apps.
+            case "$JVMARGS" in
+              project|"") echo "Keeping the project's Gradle JVM settings" ;;
+              auto)
+                if [ "$RUNNER_OS" = "macOS" ]; then
+                  RAM_MB=$(( $(sysctl -n hw.memsize) / 1024 / 1024 ))
+                else
+                  RAM_MB=$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) / 1024 ))
+                fi
+                # Leave the rest for clang/ninja (native code) and Metro.
+                GRADLE_MB=$(( RAM_MB * 40 / 100 )); [ "$GRADLE_MB" -gt 8192 ] && GRADLE_MB=8192
+                KOTLIN_MB=$(( RAM_MB * 25 / 100 )); [ "$KOTLIN_MB" -gt 4096 ] && KOTLIN_MB=4096
+                [ "$GRADLE_MB" -lt 2048 ] && GRADLE_MB=2048
+                [ "$KOTLIN_MB" -lt 1024 ] && KOTLIN_MB=1024
+                COMMON="-XX:MaxMetaspaceSize=1g -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8"
+                {
+                  printf '\norg.gradle.jvmargs=-Xmx%dm %s\n' "$GRADLE_MB" "$COMMON"
+                  printf 'kotlin.daemon.jvmargs=-Xmx%dm %s\n' "$KOTLIN_MB" "$COMMON"
+                } >> ~/.gradle/gradle.properties
+                echo "Runner RAM ${RAM_MB} MB → Gradle heap ${GRADLE_MB} MB, Kotlin daemon ${KOTLIN_MB} MB, metaspace 1 GB each"
+                ;;
+              *)
+                printf '\norg.gradle.jvmargs=%s\n' "$JVMARGS" >> ~/.gradle/gradle.properties
+                echo "org.gradle.jvmargs=$JVMARGS"
+                ;;
+            esac
           fi
 
           if [ "$CCACHE" = "true" ]; then
