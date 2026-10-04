@@ -200,6 +200,8 @@ See [Making Builds Faster](#-making-builds-faster) for how these fit together.
 | `release-tag`     | Release tag to attach to.                                                                                    | triggering tag |
 | `submit`          | Run `eas submit` with the built binary. The submission itself runs on EAS servers.                           | `"false"` |
 | `submit-profile`  | Submit profile from `eas.json`.                                                                              | `profile` |
+| `submit-tracks`   | Google Play tracks to submit to (Android, needs `submit`): any of `internal`, `closed`, `open`, `production`, comma-separated, or a custom track name. See [Google Play tracks](#google-play-tracks). | `""` (profile's track) |
+| `submit-release-status` | `completed`, `draft`, `halted` or `inProgress` for `submit-tracks`. Use `draft` for an app that has never been released. | profile's, else `completed` |
 
 #### Firebase App Distribution
 
@@ -237,6 +239,7 @@ See [Firebase App Distribution](#-firebase-app-distribution) for setup.
 | `EXPO_TOKEN`    | Yes\*    | Expo access token.                                                                                       |
 | `DOPPLER_TOKEN` | No       | Doppler token. Its config's secrets are loaded as build-time env vars (see [Build Environment](#-build-environment--doppler)). |
 | `BUILD_ENV`     | No       | **Secret** build-time env vars, one `KEY=VALUE` per line. Every value is masked in the logs.             |
+| `PLAY_SERVICE_ACCOUNT` | No | JSON key of a Google Play service account. Without it, `eas submit` uses the key stored on EAS. |
 | `FIREBASE_SERVICE_ACCOUNT` | With `firebase-distribute` | JSON key of a service account with the **Firebase App Distribution Admin** role. It can also be a `FIREBASE_SERVICE_ACCOUNT` variable in Doppler or `BUILD_ENV`. |
 
 \* It is declared optional so that you can provide it through a GitHub `environment` instead. If it is missing at runtime, the job fails early with a clear error.
@@ -421,6 +424,31 @@ jobs:
 ```
 
 `eas submit` uses the submit profile in `eas.json`, and the store credentials stored on EAS (for Android, a Google service account key).
+
+#### Google Play tracks
+
+Set `submit-tracks` to pick the destination at run time. The build runs once and the same `.aab` is submitted to each track in turn, so you can select several:
+
+| Value        | Play track   |
+| :----------- | :----------- |
+| `internal`   | Internal testing |
+| `closed`     | Closed testing (`alpha`) |
+| `open`       | Open testing (`beta`) |
+| `production` | Production |
+| anything else | A custom closed track, by its name |
+
+```yaml
+    with:
+      profile: production
+      submit: "true"
+      submit-tracks: "internal,closed"
+```
+
+- The tracks must already exist in Play Console. Submitting uploads to a track but can't create one, and closed testing needs its testers attached there.
+- The build must be an `.aab`, and its version code must be higher than every release on those tracks.
+- For a never-released app, add `submit-release-status: draft`.
+- Credentials: either the Google Play service account key stored on EAS (`eas credentials`, nothing to add here), or pass its JSON as the `PLAY_SERVICE_ACCOUNT` secret. The account needs the **Release manager** permission on the app.
+- `eas.json` needs a submit profile (e.g. `"submit": { "production": {} }`). It's copied per track in the runner, and your file is restored afterwards.
 
 ### Doppler with a personal token
 
