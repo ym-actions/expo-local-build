@@ -1281,6 +1281,8 @@ jobs:
             fi
             KEY_PATH="$RUNNER_TEMP/play-service-account.json"
             (umask 077 && printf '%s' "$PLAY_SA" > "$KEY_PATH")
+          else
+            echo "::notice title=No PLAY_SERVICE_ACCOUNT::Using the Google Play key stored on EAS. If submit fails with 'Google Service Account Keys cannot be set up in --non-interactive mode', none is stored: run 'eas credentials' (Android → Google Service Account Key for Play Store Submissions) or pass the PLAY_SERVICE_ACCOUNT secret."
           fi
 
           cp eas.json "$RUNNER_TEMP/eas.json.orig"
@@ -1315,7 +1317,7 @@ jobs:
               SUBMITTED="${SUBMITTED:+$SUBMITTED, }$NAME"
             else
               FAILED="${FAILED:+$FAILED, }$NAME"
-              echo "::error title=Submit to $NAME failed::eas submit failed for track '$TRACK'. Check that the track exists in Play Console and that the version code is higher than any release on it."
+              echo "::error title=Submit to $NAME failed::eas submit failed for track '$TRACK'. If the log says a Google Service Account Key cannot be set up, no Play key is available: add the PLAY_SERVICE_ACCOUNT secret or store one on EAS. Otherwise check that the track exists in Play Console and that the version code is higher than any release on it."
             fi
             echo "::endgroup::"
           done
