@@ -158,6 +158,38 @@ on:
         default: ""
         type: string
 
+      # ── Firebase App Distribution ───────────────────────────────────────────
+      firebase-distribute:
+        description: "Upload the binary to Firebase App Distribution (needs the FIREBASE_SERVICE_ACCOUNT secret)"
+        required: false
+        default: "false"
+        type: string
+      firebase-app-id:
+        description: "Firebase app ID (1:123:android:abc). 'auto' finds it in google-services.json / GoogleService-Info.plist by the package the profile builds"
+        required: false
+        default: "auto"
+        type: string
+      firebase-groups:
+        description: "Tester group aliases to notify, comma-separated"
+        required: false
+        default: ""
+        type: string
+      firebase-testers:
+        description: "Tester emails to notify, comma-separated"
+        required: false
+        default: ""
+        type: string
+      firebase-release-notes:
+        description: "Release notes shown to testers. 'auto' uses the PR title or commit message, plus profile, version and commit"
+        required: false
+        default: "auto"
+        type: string
+      firebase-tools-version:
+        description: "Version of firebase-tools used to upload"
+        required: false
+        default: "latest"
+        type: string
+
       # ── Reporting ───────────────────────────────────────────────────────────
       comment-on-pr:
         description: "Post/update a sticky PR comment with a link to the build (and failures). Needs pull-requests: write"
@@ -202,6 +234,9 @@ on:
       BUILD_ENV:
         description: "Secret build-time environment variables, one KEY=VALUE per line (values are masked in logs)"
         required: false
+      FIREBASE_SERVICE_ACCOUNT:
+        description: "JSON key of a service account with the Firebase App Distribution Admin role. Can also come from Doppler / BUILD_ENV as FIREBASE_SERVICE_ACCOUNT"
+        required: false
 
     outputs:
       artifact-path:
@@ -225,6 +260,15 @@ on:
       build-seconds:
         description: "Duration of the eas build step, in seconds"
         value: ${{ jobs.build.outputs.build-seconds }}
+      version-code:
+        description: "Android versionCode / iOS build number of the binary (apk and ipa only)"
+        value: ${{ jobs.build.outputs.version-code }}
+      firebase-console-url:
+        description: "Firebase console link to the App Distribution release"
+        value: ${{ jobs.build.outputs.firebase-console-url }}
+      firebase-testing-url:
+        description: "Link testers can open to install the App Distribution release"
+        value: ${{ jobs.build.outputs.firebase-testing-url }}
 
 jobs:
   build:
@@ -260,6 +304,9 @@ jobs:
       app-version: ${{ steps.build.outputs.version }}
       release-url: ${{ steps.release.outputs.url }}
       build-seconds: ${{ steps.build.outputs.seconds }}
+      version-code: ${{ steps.build.outputs.version-code }}
+      firebase-console-url: ${{ steps.firebase.outputs.console-url }}
+      firebase-testing-url: ${{ steps.firebase.outputs.testing-url }}
 
     steps:
       - name: Checkout
@@ -832,6 +879,97 @@ jobs:
           fi
           eas --version
 
+      # Runs before the build so a missing key or unregistered app fails in seconds,
+      # not after a 20-minute build.
+      - name: Resolve Firebase App
+        id: firebase-app
+        if: ${{ inputs.firebase-distribute == 'true' }}
+        env:
+          SA_SECRET: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          PLATFORM: ${{ inputs.platform }}
+          PROFILE: ${{ inputs.profile }}
+          INPUT_APP_ID: ${{ inputs.firebase-app-id }}
+          GROUPS: ${{ inputs.firebase-groups }}
+          TESTERS: ${{ inputs.firebase-testers }}
+        run: |
+          set -euo pipefail
+
+          # ── Credentials ──────────────────────────────────────────────────
+          # The secret wins; otherwise accept FIREBASE_SERVICE_ACCOUNT loaded from Doppler / BUILD_ENV.
+          SA="${SA_SECRET:-${FIREBASE_SERVICE_ACCOUNT:-}}"
+          if [ -z "$SA" ]; then
+            echo "::error title=Missing FIREBASE_SERVICE_ACCOUNT::firebase-distribute is on but no service account key was found. Pass the FIREBASE_SERVICE_ACCOUNT secret (see README)."
+            exit 1
+          fi
+          if ! echo "$SA" | jq -e '.type == "service_account" and (.client_email | type == "string")' >/dev/null 2>&1; then
+            echo "::error title=Invalid FIREBASE_SERVICE_ACCOUNT::FIREBASE_SERVICE_ACCOUNT must be the full JSON key of a Google Cloud service account (it starts with {\"type\": \"service_account\", ...})."
+            exit 1
+          fi
+          echo "Service account: $(echo "$SA" | jq -r .client_email)"
+          if [ -z "$GROUPS" ] && [ -z "$TESTERS" ]; then
+            echo "::warning title=No Firebase testers::Neither firebase-groups nor firebase-testers is set, so the release will be uploaded but nobody will be notified."
+          fi
+
+          # ── App ID ───────────────────────────────────────────────────────
+          if [ "$INPUT_APP_ID" != "auto" ] && [ -n "$INPUT_APP_ID" ]; then
+            echo "app-id=$INPUT_APP_ID" >> "$GITHUB_OUTPUT"
+            echo "Firebase app: $INPUT_APP_ID (from firebase-app-id)"
+            exit 0
+          fi
+
+          # Read the app config the way this profile sees it: its eas.json env (following
+          # `extends`) can change the package name, e.g. APP_VARIANT=preview → *.preview.
+          CONFIG="$(node -e '
+            const fs = require("fs");
+            const { execFileSync } = require("child_process");
+            const eas = JSON.parse(fs.readFileSync("eas.json", "utf8"));
+            const chain = [];
+            const seen = new Set();
+            for (let p = process.env.PROFILE; p && !seen.has(p) && eas.build && eas.build[p]; p = eas.build[p].extends) {
+              seen.add(p);
+              chain.unshift(eas.build[p]);
+            }
+            const env = Object.assign({}, ...chain.map((b) => b.env || {}));
+            process.stdout.write(execFileSync("npx", ["--no-install", "expo", "config", "--json", "--type", "public"], {
+              env: { ...process.env, ...env },
+              stdio: ["ignore", "pipe", "inherit"],
+            }));
+          ')"
+
+          if [ "$PLATFORM" = "android" ]; then
+            ID="$(echo "$CONFIG" | jq -r '.android.package // empty')"
+            FILE="$(echo "$CONFIG" | jq -r '.android.googleServicesFile // "google-services.json"')"
+            if [ -z "$ID" ]; then
+              echo "::error title=No Android package::The app config has no android.package, so the Firebase app can't be found. Set firebase-app-id."
+              exit 1
+            fi
+            if [ ! -f "$FILE" ]; then
+              echo "::error title=google-services.json not found::'$FILE' doesn't exist, so the Firebase app ID can't be looked up. Add it (android.googleServicesFile) or set firebase-app-id."
+              exit 1
+            fi
+            APP_ID="$(jq -r --arg p "$ID" '[.client[] | select(.client_info.android_client_info.package_name == $p) | .client_info.mobilesdk_app_id][0] // empty' "$FILE")"
+            if [ -z "$APP_ID" ]; then
+              echo "::error title=Firebase app not found::No app with package '$ID' in $FILE. Register it in the Firebase console (Project settings → Add app), download the new google-services.json, or set firebase-app-id. Packages in the file: $(jq -r '[.client[].client_info.android_client_info.package_name] | join(", ")' "$FILE")"
+              exit 1
+            fi
+          else
+            ID="$(echo "$CONFIG" | jq -r '.ios.bundleIdentifier // empty')"
+            FILE="$(echo "$CONFIG" | jq -r '.ios.googleServicesFile // "GoogleService-Info.plist"')"
+            if [ ! -f "$FILE" ]; then
+              echo "::error title=GoogleService-Info.plist not found::'$FILE' doesn't exist, so the Firebase app ID can't be looked up. Add it (ios.googleServicesFile) or set firebase-app-id."
+              exit 1
+            fi
+            APP_ID="$(plutil -extract GOOGLE_APP_ID raw "$FILE" 2>/dev/null || true)"
+            PLIST_BUNDLE="$(plutil -extract BUNDLE_ID raw "$FILE" 2>/dev/null || true)"
+            if [ -z "$APP_ID" ] || { [ -n "$ID" ] && [ "$PLIST_BUNDLE" != "$ID" ]; }; then
+              echo "::error title=Firebase app not found::$FILE is for '$PLIST_BUNDLE', but this profile builds '$ID'. Use the plist for that bundle ID, or set firebase-app-id."
+              exit 1
+            fi
+          fi
+
+          echo "app-id=$APP_ID" >> "$GITHUB_OUTPUT"
+          echo "Firebase app: $APP_ID ($ID, from $FILE)"
+
       - name: Build
         id: build
         env:
@@ -899,15 +1037,35 @@ jobs:
           mv "$FILE" "$DEST"
           SIZE="$(du -h "$DEST" | cut -f1)"
 
+          # Build number of the binary (remote app versions are bumped by EAS during the build,
+          # so the config doesn't know it). Best effort: apk via aapt2, ipa via its Info.plist.
+          VERSION_CODE=""
+          case "$TYPE" in
+            apk)
+              AAPT2="$(ls -d "${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/nonexistent}}"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -n1 || true)"
+              if [ -n "$AAPT2" ]; then
+                VERSION_CODE="$("$AAPT2" dump badging "$DEST" 2>/dev/null | sed -nE "s/.*versionCode='([0-9]+)'.*/\1/p" | head -n1 || true)"
+              fi
+              ;;
+            ipa)
+              PLIST="$(mktemp)"
+              if unzip -p "$DEST" 'Payload/*.app/Info.plist' > "$PLIST" 2>/dev/null; then
+                VERSION_CODE="$(plutil -extract CFBundleVersion raw "$PLIST" 2>/dev/null || true)"
+              fi
+              rm -f "$PLIST"
+              ;;
+          esac
+
           {
             echo "path=${DEST#"$GITHUB_WORKSPACE"/}"
             echo "name=$NAME"
             echo "type=$TYPE"
             echo "version=$VERSION"
+            echo "version-code=$VERSION_CODE"
             echo "size=$SIZE"
           } >> "$GITHUB_OUTPUT"
 
-          echo "::notice title=Build complete::$NAME.$TYPE ($SIZE)"
+          echo "::notice title=Build complete::$NAME.$TYPE ($SIZE)${VERSION:+, version $VERSION}${VERSION_CODE:+ ($VERSION_CODE)}"
 
       - name: Collect Cache Stats
         id: cache-stats
@@ -973,6 +1131,93 @@ jobs:
           files: ${{ github.workspace }}/${{ steps.build.outputs.path }}
           fail_on_unmatched_files: true
 
+      - name: Distribute with Firebase
+        id: firebase
+        if: ${{ inputs.firebase-distribute == 'true' && steps.build.outcome == 'success' }}
+        env:
+          SA_SECRET: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          APP_ID: ${{ steps.firebase-app.outputs.app-id }}
+          FILE: ${{ github.workspace }}/${{ steps.build.outputs.path }}
+          TYPE: ${{ steps.build.outputs.type }}
+          GROUPS: ${{ inputs.firebase-groups }}
+          TESTERS: ${{ inputs.firebase-testers }}
+          INPUT_NOTES: ${{ inputs.firebase-release-notes }}
+          TOOLS_VERSION: ${{ inputs.firebase-tools-version }}
+          PROFILE: ${{ inputs.profile }}
+          VERSION: ${{ steps.build.outputs.version }}
+          VERSION_CODE: ${{ steps.build.outputs.version-code }}
+          SHA: ${{ steps.config.outputs.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+
+          if [ "$TYPE" = "tar.gz" ]; then
+            echo "::error title=Can't distribute a simulator build::Firebase App Distribution needs an .ipa. Use a profile that builds for devices."
+            exit 1
+          fi
+
+          # Write the key to a private temp file for the duration of this step only.
+          CREDS="$RUNNER_TEMP/firebase-sa-$(openssl rand -hex 6).json"
+          trap 'rm -f "$CREDS"' EXIT
+          (umask 077 && printf '%s' "${SA_SECRET:-${FIREBASE_SERVICE_ACCOUNT:-}}" > "$CREDS")
+          export GOOGLE_APPLICATION_CREDENTIALS="$CREDS"
+
+          # ── Release notes ────────────────────────────────────────────────
+          NOTES_FILE="$RUNNER_TEMP/firebase-release-notes.txt"
+          if [ "$INPUT_NOTES" = "auto" ]; then
+            if [ -n "$PR_NUMBER" ]; then
+              SUMMARY="PR #$PR_NUMBER: $PR_TITLE"
+            elif [ -n "$HEAD_COMMIT_MESSAGE" ]; then
+              SUMMARY="$(printf '%s\n' "$HEAD_COMMIT_MESSAGE" | head -n1)"
+            else
+              SUMMARY="$(git log -1 --format=%s 2>/dev/null || true)"
+            fi
+            {
+              [ -n "$SUMMARY" ] && printf '%s\n\n' "$SUMMARY"
+              printf '%s · %s%s · %s@%s\n' "$PROFILE" "${VERSION:-?}" "${VERSION_CODE:+ ($VERSION_CODE)}" "$GITHUB_REF_NAME" "${SHA:0:7}"
+            } > "$NOTES_FILE"
+          else
+            printf '%s\n' "$INPUT_NOTES" > "$NOTES_FILE"
+          fi
+          echo "::group::Release notes"
+          cat "$NOTES_FILE"
+          echo "::endgroup::"
+
+          # ── Upload ───────────────────────────────────────────────────────
+          args=(appdistribution:distribute "$FILE" --app "$APP_ID" --release-notes-file "$NOTES_FILE")
+          [ -n "$GROUPS" ] && args+=(--groups "$GROUPS")
+          [ -n "$TESTERS" ] && args+=(--testers "$TESTERS")
+
+          OUT="$RUNNER_TEMP/firebase-distribute.log"
+          set +e
+          npx --yes "firebase-tools@$TOOLS_VERSION" "${args[@]}" 2>&1 | tee "$OUT"
+          STATUS=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$STATUS" -ne 0 ]; then
+            if [ "$TYPE" = "aab" ]; then
+              echo "::error title=Firebase rejected the app bundle::Distributing .aab files needs the Firebase project linked to Google Play (Project settings → Integrations → Google Play), and the app must exist in Play Console. Distribute an APK profile instead, or link Play."
+            fi
+            if grep -qiE 'permission|403|forbidden' "$OUT"; then
+              echo "::error title=Firebase permission denied::Give the service account the 'Firebase App Distribution Admin' role in Google Cloud IAM, for the project that owns app $APP_ID."
+            fi
+            if grep -qiE '404|not found' "$OUT"; then
+              echo "::error title=Firebase app not found::Check that app $APP_ID exists, that App Distribution is enabled (Firebase console → App Distribution → Get started), and that the service account belongs to the same project."
+            fi
+            exit "$STATUS"
+          fi
+
+          CLEAN="$(sed -E 's/\x1b\[[0-9;]*m//g' "$OUT")"
+          CONSOLE_URL="$(echo "$CLEAN" | grep -oE 'https://console\.firebase\.google\.com/[^ ]+' | head -n1 || true)"
+          TESTING_URL="$(echo "$CLEAN" | grep -oE 'https://appdistribution\.firebase(\.google)?\.(com|dev)/[^ ]+' | head -n1 || true)"
+          {
+            echo "console-url=$CONSOLE_URL"
+            echo "testing-url=$TESTING_URL"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice title=Sent to Firebase App Distribution::${GROUPS:+groups: $GROUPS }${TESTERS:+testers: $TESTERS }${CONSOLE_URL}"
+
       - name: Submit to Store
         id: submit
         if: ${{ inputs.submit == 'true' }}
@@ -996,6 +1241,11 @@ jobs:
           ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
           RELEASE_URL: ${{ steps.release.outputs.url }}
           SUBMITTED: ${{ steps.submit.outcome == 'success' }}
+          VERSION_CODE: ${{ steps.build.outputs.version-code }}
+          FIREBASE_OUTCOME: ${{ steps.firebase.outcome }}
+          FIREBASE_CONSOLE: ${{ steps.firebase.outputs.console-url }}
+          FIREBASE_TESTING: ${{ steps.firebase.outputs.testing-url }}
+          FIREBASE_GROUPS: ${{ inputs.firebase-groups }}
           SHA: ${{ steps.config.outputs.sha }}
           STARTED: ${{ steps.config.outputs.started }}
           BUILD_SECONDS: ${{ steps.build.outputs.seconds }}
@@ -1018,9 +1268,17 @@ jobs:
             echo "| :-- | :-- |"
             echo "| **File** | \`$FILE_NAME\` ($SIZE) |"
             echo "| **Profile** | \`$PROFILE\` |"
-            [ -n "$VERSION" ] && echo "| **Version** | $VERSION |"
+            [ -n "$VERSION" ] && echo "| **Version** | $VERSION${VERSION_CODE:+ ($VERSION_CODE)} |"
             [ -n "$ARTIFACT_URL" ] && echo "| **Download** | [Workflow artifact]($ARTIFACT_URL) |"
             [ -n "$RELEASE_URL" ] && echo "| **Release** | $RELEASE_URL |"
+            if [ "$FIREBASE_OUTCOME" = "success" ]; then
+              LINKS=""
+              [ -n "$FIREBASE_CONSOLE" ] && LINKS="[Console]($FIREBASE_CONSOLE)"
+              [ -n "$FIREBASE_TESTING" ] && LINKS="${LINKS:+$LINKS · }[Tester link]($FIREBASE_TESTING)"
+              echo "| **Firebase** | Distributed${FIREBASE_GROUPS:+ to \`$FIREBASE_GROUPS\`}${LINKS:+ · $LINKS} |"
+            elif [ "$FIREBASE_OUTCOME" = "failure" ]; then
+              echo "| **Firebase** | ❌ Distribution failed (see the step log) |"
+            fi
             [ "$SUBMITTED" = "true" ] && echo "| **Store** | Submitted with \`eas submit\` |"
             echo "| **Commit** | \`${SHA:0:7}\` |"
             echo ""
@@ -1062,7 +1320,9 @@ jobs:
           FILE_NAME: ${{ steps.build.outputs.name }}.${{ steps.build.outputs.type }}
           SIZE: ${{ steps.build.outputs.size }}
           VERSION: ${{ steps.build.outputs.version }}
+          VERSION_CODE: ${{ steps.build.outputs.version-code }}
           ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+          FIREBASE_TESTING: ${{ steps.firebase.outputs.testing-url }}
           SHA: ${{ steps.config.outputs.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -1078,7 +1338,8 @@ jobs:
               else
                 echo "| **File** | \`$FILE_NAME\` ($SIZE) |"
               fi
-              [ -n "$VERSION" ] && echo "| **Version** | $VERSION |"
+              [ -n "$VERSION" ] && echo "| **Version** | $VERSION${VERSION_CODE:+ ($VERSION_CODE)} |"
+              [ -n "$FIREBASE_TESTING" ] && echo "| **Firebase** | [Install from App Distribution]($FIREBASE_TESTING) |"
               echo "| **Commit** | \`${SHA:0:7}\` |"
             else
               echo "### ❌ $NAME build failed"

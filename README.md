@@ -21,6 +21,7 @@
 - 🔐 **Doppler Built In:** Pass a `DOPPLER_TOKEN` and every secret in the config becomes a build-time env var, masked in the logs. This covers EAS variables with "Secret" visibility, which `eas build --local` [can't read](https://docs.expo.dev/build-reference/local-builds/).
 - 🌍 **One Token per Environment:** Combine `environment` with GitHub environment secrets so each profile loads its own Doppler config, and production can require an approval.
 - 📦 **Ready-to-Share Binaries:** Uploads the `.apk` / `.aab` / `.ipa` as a nicely named workflow artifact. It can also attach it to a GitHub Release, or hand it to `eas submit`.
+- 🔥 **Firebase App Distribution:** Send builds straight to your testers. The Firebase app ID is found automatically from `google-services.json` / `GoogleService-Info.plist`, for the package each profile builds.
 - 💬 **Sticky PR Comments:** On pull requests, the download link is posted on the PR and updated on every push. If a build fails, the comment says so.
 - 📦 **Zero-Config Toolchain:** Detects npm, pnpm, yarn (classic & berry) or bun, reads `.nvmrc` / `.node-version`, and sets up Java and the Android SDK when needed.
 - ⚙️ **Smart Caching:** Caches package manager downloads, Gradle dependencies, Gradle's build cache and CocoaPods between runs. Caches are saved from the default branch, where every branch and tag can read them.
@@ -52,6 +53,9 @@ graph TD
     K -->|Yes| K1[Workflow Artifact]
     J --> L{Release tag?}
     L -->|Yes| L1[Attach to GitHub Release]
+    J --> FB{firebase-distribute?}
+    FB -->|Yes| FB1[Firebase App Distribution]
+    FB1 --> N
     J --> M{submit?}
     M -->|Yes| M1[eas submit]
     K1 --> N[Job Summary & Outputs]
@@ -197,6 +201,19 @@ See [Making Builds Faster](#-making-builds-faster) for how these fit together.
 | `submit`          | Run `eas submit` with the built binary. The submission itself runs on EAS servers.                           | `"false"` |
 | `submit-profile`  | Submit profile from `eas.json`.                                                                              | `profile` |
 
+#### Firebase App Distribution
+
+See [Firebase App Distribution](#-firebase-app-distribution) for setup.
+
+| Input                    | Description                                                                                       | Default    |
+| :----------------------- | :------------------------------------------------------------------------------------------------ | :--------- |
+| `firebase-distribute`    | Upload the binary to Firebase App Distribution.                                                   | `"false"`  |
+| `firebase-app-id`        | Firebase app ID, e.g. `1:1234:android:abcd`. `"auto"` looks it up by the package this profile builds. | `"auto"` |
+| `firebase-groups`        | Tester group aliases to notify, comma-separated.                                                  | `""`       |
+| `firebase-testers`       | Tester emails to notify, comma-separated.                                                         | `""`       |
+| `firebase-release-notes` | Notes shown to testers. `"auto"` uses the PR title or commit message, followed by profile, version, build number and commit. | `"auto"` |
+| `firebase-tools-version` | Version of [`firebase-tools`](https://www.npmjs.com/package/firebase-tools) used to upload.      | `"latest"` |
+
 #### Reporting
 
 | Input           | Description                                                                                 | Default                  |
@@ -220,6 +237,7 @@ See [Making Builds Faster](#-making-builds-faster) for how these fit together.
 | `EXPO_TOKEN`    | Yes\*    | Expo access token.                                                                                       |
 | `DOPPLER_TOKEN` | No       | Doppler token. Its config's secrets are loaded as build-time env vars (see [Build Environment](#-build-environment--doppler)). |
 | `BUILD_ENV`     | No       | **Secret** build-time env vars, one `KEY=VALUE` per line. Every value is masked in the logs.             |
+| `FIREBASE_SERVICE_ACCOUNT` | With `firebase-distribute` | JSON key of a service account with the **Firebase App Distribution Admin** role. It can also be a `FIREBASE_SERVICE_ACCOUNT` variable in Doppler or `BUILD_ENV`. |
 
 \* It is declared optional so that you can provide it through a GitHub `environment` instead. If it is missing at runtime, the job fails early with a clear error.
 
@@ -246,6 +264,45 @@ A failure to post the PR comment never fails the build.
 | `app-version`   | App version from the Expo config.                                  |
 | `release-url`   | URL of the GitHub Release the binary was attached to.              |
 | `build-seconds` | Duration of the `eas build` step, in seconds.                      |
+| `version-code`  | Android `versionCode` / iOS build number of the binary (`apk` and `ipa` only). |
+| `firebase-console-url` | Firebase console link to the App Distribution release.      |
+| `firebase-testing-url` | Link testers can open to install the release.               |
+
+---
+
+## 🔥 Firebase App Distribution
+
+```yaml
+    with:
+      profile: preview
+      firebase-distribute: "true"
+      firebase-groups: qa
+    secrets:
+      EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+      FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+```
+
+After the build, the binary is uploaded with `firebase appdistribution:distribute`, and the testers in `firebase-groups` / `firebase-testers` get an email. The console and tester links appear in the job summary, the outputs and the PR comment.
+
+### One-time setup
+
+1. **Register each package as an app in Firebase.** Firebase treats every package name or bundle ID as a separate app. If your profiles build different packages (e.g. `com.acme.app` and `com.acme.app.preview`), add each one under **Project settings → Your apps → Add app**, then commit the updated `google-services.json` / `GoogleService-Info.plist`.
+2. **Turn on App Distribution.** In the Firebase console, open **App Distribution** and click **Get started**. Under **Testers & Groups**, create a group (e.g. `qa`). Its *alias* is what goes in `firebase-groups`.
+3. **Create a service account.** In [Google Cloud console](https://console.cloud.google.com/iam-admin/serviceaccounts), select the Firebase project and click **Create service account**. Give it the **Firebase App Distribution Admin** role, then under **Keys → Add key → JSON** download a key. Save the whole JSON file as the `FIREBASE_SERVICE_ACCOUNT` secret. (The old `firebase login:ci` tokens are deprecated and not supported.)
+
+### How the app ID is found
+
+With `firebase-app-id: "auto"`, the workflow reads your app config the way the build profile sees it, including the profile's `env` in `eas.json` and anything it `extends`. This matters because an `APP_VARIANT`-style variable often changes the package name. It then looks that package up in `google-services.json` (Android), or checks `GoogleService-Info.plist`'s `BUNDLE_ID` (iOS). This happens **before** the build, so an unregistered package fails in seconds, listing the packages it did find. Set `firebase-app-id` to skip the lookup.
+
+### APK, AAB and IPA
+
+- **APK** (e.g. profiles with `"distribution": "internal"`): works out of the box.
+- **AAB** (store builds): Firebase can only distribute app bundles when the Firebase project is **linked to Google Play** (**Project settings → Integrations → Google Play**) and the app exists in Play Console. For store builds, Play's internal testing track (`submit: "true"`) is usually the better fit.
+- **IPA**: ad hoc builds only install on devices registered in the provisioning profile. Register testers' devices with `eas device:create` and rebuild. iOS simulator builds can't be distributed.
+
+### Build numbers
+
+Firebase accepts the same version again. Re-uploading an identical binary just updates the existing release, and a new binary with the same number becomes a new release. Either way, testers keep seeing the same "1.0.0 (1)", which is confusing. With `"appVersionSource": "remote"` in `eas.json`, add `"autoIncrement": true` to the profiles you distribute. EAS then bumps the build number on every build, including local ones. The user-facing version (`1.0.0`) still comes from your app config.
 
 ---
 
@@ -421,6 +478,14 @@ jobs:
 ### The build hangs with `OutOfMemoryError: Metaspace`
 
 Cancel it, because it won't recover. Make sure `gradle-jvmargs` is `"auto"` (the default) or a value with enough metaspace, e.g. `"-Xmx4g -XX:MaxMetaspaceSize=1g"`.
+
+### Firebase distribution fails
+
+The step prints a specific hint for common failures:
+
+- **Permission denied / 403**: the service account needs the *Firebase App Distribution Admin* role, in the project that owns the app.
+- **Not found / 404**: App Distribution isn't enabled yet (**Get started** in the console), or the service account belongs to a different project.
+- **App bundle rejected**: link the Firebase project to Google Play, or distribute an APK profile instead.
 
 ### "No space left on device"
 
