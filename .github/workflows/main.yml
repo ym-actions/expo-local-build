@@ -157,13 +157,13 @@ on:
         required: false
         default: ""
         type: string
-      submit-tracks:
-        description: "Google Play tracks to submit to, comma-separated: internal, closed, open, production (or a custom track name). One eas submit runs per track with the same binary. Empty keeps the track set in the submit profile. Android only"
+      submit-track:
+        description: "Google Play track to submit to: internal, closed, open, production (or a custom track name). Google Play accepts a version code on one track only, so it is one build per track. Empty keeps the track set in the submit profile. Android only"
         required: false
         default: ""
         type: string
       submit-release-status:
-        description: "Play release status for submit-tracks: completed, draft, halted or inProgress. Empty keeps the profile's value, or uses completed. Use draft while the app has never been released"
+        description: "Play release status for submit-track: completed, draft, halted or inProgress. Empty keeps the profile's value, or uses completed. Use draft while the app has never been released"
         required: false
         default: ""
         type: string
@@ -1247,20 +1247,20 @@ jobs:
           PLAY_SA: ${{ secrets.PLAY_SERVICE_ACCOUNT }}
           PLATFORM: ${{ inputs.platform }}
           SUBMIT_PROFILE: ${{ inputs.submit-profile || inputs.profile }}
-          TRACKS: ${{ inputs.submit-tracks }}
+          TRACK_INPUT: ${{ inputs.submit-track }}
           RELEASE_STATUS: ${{ inputs.submit-release-status }}
           FILE: ${{ github.workspace }}/${{ steps.build.outputs.path }}
           FILE_TYPE: ${{ steps.build.outputs.type }}
         run: |
           set -euo pipefail
 
-          if [ -z "$TRACKS" ]; then
+          if [ -z "$TRACK_INPUT" ]; then
             eas submit --non-interactive --platform "$PLATFORM" --profile "$SUBMIT_PROFILE" --path "$FILE"
             exit 0
           fi
 
           if [ "$PLATFORM" != "android" ]; then
-            echo "::error title=submit-tracks is Android only::Google Play tracks don't apply to $PLATFORM. Leave submit-tracks empty."
+            echo "::error title=submit-track is Android only::Google Play tracks don't apply to $PLATFORM. Leave submit-track empty."
             exit 1
           fi
           if [ "$FILE_TYPE" != "aab" ]; then
@@ -1288,42 +1288,36 @@ jobs:
           cp eas.json "$RUNNER_TEMP/eas.json.orig"
           trap 'cp "$RUNNER_TEMP/eas.json.orig" eas.json; [ -z "$KEY_PATH" ] || rm -f "$KEY_PATH"' EXIT
 
-          SUBMITTED=""
-          FAILED=""
-          IFS=',' read -ra LIST <<< "$TRACKS"
-          for RAW in "${LIST[@]}"; do
-            NAME="$(echo "$RAW" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
-            [ -n "$NAME" ] || continue
-            case "$NAME" in
-              internal)   TRACK=internal ;;
-              closed)     TRACK=alpha ;;
-              open)       TRACK=beta ;;
-              production) TRACK=production ;;
-              *)          TRACK="$NAME" ;; # custom closed track, used as-is
-            esac
+          NAME="$(echo "$TRACK_INPUT" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+          case "$NAME" in
+            *,*)
+              echo "::error title=One track per build::Google Play accepts a version code on a single track, so submit-track takes one value ('$TRACK_INPUT'). Promote the release between tracks in Play Console, or build again."
+              exit 1 ;;
+            internal)   TRACK=internal ;;
+            closed)     TRACK=alpha ;;
+            open)       TRACK=beta ;;
+            production) TRACK=production ;;
+            *)          TRACK="$NAME" ;; # custom closed track, used as-is
+          esac
 
-            # A throwaway submit profile: the chosen profile plus this track.
-            TMP_PROFILE="_track_$TRACK"
-            jq --arg p "$SUBMIT_PROFILE" --arg t "$TMP_PROFILE" --arg track "$TRACK" \
-               --arg status "$RELEASE_STATUS" --arg key "$KEY_PATH" '
-              .submit[$t] = .submit[$p]
-              | .submit[$t].android.track = $track
-              | .submit[$t].android.releaseStatus = (if $status != "" then $status else (.submit[$p].android.releaseStatus // "completed") end)
-              | if $key != "" then .submit[$t].android.serviceAccountKeyPath = $key else . end
-            ' "$RUNNER_TEMP/eas.json.orig" > eas.json
+          # A throwaway submit profile: the chosen profile plus this track.
+          TMP_PROFILE="_track_$TRACK"
+          jq --arg p "$SUBMIT_PROFILE" --arg t "$TMP_PROFILE" --arg track "$TRACK" \
+             --arg status "$RELEASE_STATUS" --arg key "$KEY_PATH" '
+            .submit[$t] = .submit[$p]
+            | .submit[$t].android.track = $track
+            | .submit[$t].android.releaseStatus = (if $status != "" then $status else (.submit[$p].android.releaseStatus // "completed") end)
+            | if $key != "" then .submit[$t].android.serviceAccountKeyPath = $key else . end
+          ' "$RUNNER_TEMP/eas.json.orig" > eas.json
 
-            echo "::group::Submit to Google Play: $NAME (track: $TRACK)"
-            if eas submit --non-interactive --platform android --profile "$TMP_PROFILE" --path "$FILE"; then
-              SUBMITTED="${SUBMITTED:+$SUBMITTED, }$NAME"
-            else
-              FAILED="${FAILED:+$FAILED, }$NAME"
-              echo "::error title=Submit to $NAME failed::eas submit failed for track '$TRACK'. If the log says a Google Service Account Key cannot be set up, no Play key is available: add the PLAY_SERVICE_ACCOUNT secret or store one on EAS. Otherwise check that the track exists in Play Console and that the version code is higher than any release on it."
-            fi
+          echo "::group::Submit to Google Play: $NAME (track: $TRACK)"
+          if ! eas submit --non-interactive --platform android --profile "$TMP_PROFILE" --path "$FILE"; then
             echo "::endgroup::"
-          done
-
-          echo "tracks=$SUBMITTED" >> "$GITHUB_OUTPUT"
-          [ -z "$FAILED" ] || { echo "::error::Failed tracks: $FAILED"; exit 1; }
+            echo "::error title=Submit to $NAME failed::eas submit failed for track '$TRACK'. If the log says a Google Service Account Key cannot be set up, no Play key is available: add the PLAY_SERVICE_ACCOUNT secret or store one on EAS. 'You've already submitted this version' means the version code is already on a track: build again. Otherwise check that the track exists in Play Console."
+            exit 1
+          fi
+          echo "::endgroup::"
+          echo "track=$NAME" >> "$GITHUB_OUTPUT"
 
       - name: Write Job Summary
         if: ${{ always() && steps.build.outcome == 'success' }}
@@ -1336,7 +1330,7 @@ jobs:
           ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
           RELEASE_URL: ${{ steps.release.outputs.url }}
           SUBMITTED: ${{ steps.submit.outcome == 'success' }}
-          SUBMITTED_TRACKS: ${{ steps.submit.outputs.tracks }}
+          SUBMITTED_TRACK: ${{ steps.submit.outputs.track }}
           VERSION_CODE: ${{ steps.build.outputs.version-code }}
           FIREBASE_OUTCOME: ${{ steps.firebase.outcome }}
           FIREBASE_CONSOLE: ${{ steps.firebase.outputs.console-url }}
@@ -1375,7 +1369,7 @@ jobs:
             elif [ "$FIREBASE_OUTCOME" = "failure" ]; then
               echo "| **Firebase** | ❌ Distribution failed (see the step log) |"
             fi
-            [ "$SUBMITTED" = "true" ] && echo "| **Store** | Submitted with \`eas submit\`${SUBMITTED_TRACKS:+ to Google Play: $SUBMITTED_TRACKS} |"
+            [ "$SUBMITTED" = "true" ] && echo "| **Store** | Submitted with \`eas submit\`${SUBMITTED_TRACK:+ to Google Play: $SUBMITTED_TRACK} |"
             echo "| **Commit** | \`${SHA:0:7}\` |"
             echo ""
             echo "#### ⏱️ Performance"

@@ -200,8 +200,8 @@ See [Making Builds Faster](#-making-builds-faster) for how these fit together.
 | `release-tag`     | Release tag to attach to.                                                                                    | triggering tag |
 | `submit`          | Run `eas submit` with the built binary. The submission itself runs on EAS servers.                           | `"false"` |
 | `submit-profile`  | Submit profile from `eas.json`.                                                                              | `profile` |
-| `submit-tracks`   | Google Play tracks to submit to (Android, needs `submit`): any of `internal`, `closed`, `open`, `production`, comma-separated, or a custom track name. See [Google Play tracks](#google-play-tracks). | `""` (profile's track) |
-| `submit-release-status` | `completed`, `draft`, `halted` or `inProgress` for `submit-tracks`. Use `draft` for an app that has never been released. | profile's, else `completed` |
+| `submit-track`    | Google Play track to submit to (Android, needs `submit`): `internal`, `closed`, `open`, `production`, or a custom track name. See [Google Play tracks](#google-play-tracks). | `""` (profile's track) |
+| `submit-release-status` | `completed`, `draft`, `halted` or `inProgress` for `submit-track`. Use `draft` for an app that has never been released. | profile's, else `completed` |
 
 #### Firebase App Distribution
 
@@ -427,7 +427,7 @@ jobs:
 
 #### Google Play tracks
 
-Set `submit-tracks` to pick the destination at run time. The build runs once and the same `.aab` is submitted to each track in turn, so you can select several:
+Set `submit-track` to pick the destination at run time. Google Play accepts a version code on **one track only**, so each build goes to one track (to reach another, build again, or promote the release in Play Console):
 
 | Value        | Play track   |
 | :----------- | :----------- |
@@ -441,7 +441,7 @@ Set `submit-tracks` to pick the destination at run time. The build runs once and
     with:
       profile: production
       submit: "true"
-      submit-tracks: "internal,closed"
+      submit-track: "closed"
 ```
 
 - The tracks must already exist in Play Console. Submitting uploads to a track but can't create one, and closed testing needs its testers attached there.
