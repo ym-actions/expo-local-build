@@ -193,7 +193,7 @@ See [Making Builds Faster](#-making-builds-faster) for how these fit together.
 
 | Input             | Description                                                                                                  | Default  |
 | :---------------- | :----------------------------------------------------------------------------------------------------------- | :------- |
-| `upload-artifact` | Upload the binary as a workflow artifact.                                                                    | `"true"` |
+| `upload-artifact` | Upload the binary as a workflow artifact. Turn it off when another destination (Firebase, a release, the store) is enough. The run warns if the binary would go nowhere. | `"true"` |
 | `artifact-name`   | Artifact and file name, without extension. `"auto"` gives `<slug>-<profile>-<version>-<sha>`, e.g. `moonlit-preview-1.0.0-a1b2c3d`. | `"auto"` |
 | `retention-days`  | Days to keep the artifact (number). `0` uses the repository default.                                         | `14`     |
 | `github-release`  | Attach the binary to a GitHub Release. `"auto"` does so only when the run was triggered by a tag. The release is created if it doesn't exist. Needs `contents: write`. | `"false"` |

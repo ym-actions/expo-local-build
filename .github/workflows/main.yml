@@ -329,6 +329,9 @@ jobs:
           INPUT_RELEASE_TAG: ${{ inputs.release-tag }}
           INPUT_ARCHS: ${{ inputs.android-architectures }}
           INPUT_CACHE_READ_ONLY: ${{ inputs.cache-read-only }}
+          UPLOAD_ARTIFACT: ${{ inputs.upload-artifact }}
+          FIREBASE_DISTRIBUTE: ${{ inputs.firebase-distribute }}
+          SUBMIT: ${{ inputs.submit }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           DOPPLER_PROJECT: ${{ inputs.doppler-project }}
           DOPPLER_CONFIG: ${{ inputs.doppler-config }}
@@ -390,6 +393,11 @@ jobs:
               ;;
             *) echo "::error::github-release must be 'auto', 'true' or 'false' (got '$INPUT_RELEASE')"; exit 1 ;;
           esac
+
+          # ── Destinations ─────────────────────────────────────────────────
+          if [ "$UPLOAD_ARTIFACT" != "true" ] && [ -z "$RELEASE_TAG" ] && [ "$FIREBASE_DISTRIBUTE" != "true" ] && [ "$SUBMIT" != "true" ]; then
+            echo "::warning title=The build goes nowhere::upload-artifact is off and no release, Firebase or store destination is enabled, so the binary will be discarded when the job ends."
+          fi
 
           # ── Android architectures ────────────────────────────────────────
           ARCHS=""
