@@ -359,6 +359,60 @@ Each run's summary includes the `eas build` duration, the whole job's duration, 
 
 ---
 
+## 🚀 Over-the-Air Updates
+
+`update.yml` publishes an [EAS Update](https://docs.expo.dev/eas-update/introduction/) from a GitHub runner, so JS-only changes reach installed apps without a new build. It loads the same Doppler / `BUILD_ENV` variables as `main.yml`, so `EXPO_PUBLIC_*` values are baked into the update exactly as they are into a build.
+
+```yaml
+name: Update
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        type: choice
+        options: [development, preview, production]
+        default: preview
+      platform:
+        type: choice
+        options: [all, android, ios]
+        default: all
+      message:
+        description: Update message (empty uses the latest commit)
+        default: ""
+
+jobs:
+  update:
+    uses: ym-actions/expo-local-build/.github/workflows/update.yml@1.x
+    with:
+      channel: ${{ inputs.channel }}
+      platform: ${{ inputs.platform }}
+      message: ${{ inputs.message || 'auto' }}
+      environment: ${{ inputs.channel }}
+    secrets:
+      EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+      DOPPLER_TOKEN: ${{ secrets.DOPPLER_TOKEN }}
+```
+
+Before the first update, your app needs `updates.url`, a `runtimeVersion` and a `channel` on each `eas.json` build profile (`eas update:configure` sets them up), and installed builds must have been made with that config. The workflow checks the Expo config first and fails in seconds when it is missing.
+
+| Input | Default | Description |
+| :-- | :-- | :-- |
+| `channel` | `production` | Channel to publish to. Builds receive updates for the channel set in their `eas.json` profile. A channel no profile uses gets a warning. |
+| `platform` | `all` | `all`, `android` or `ios`. |
+| `message` | `auto` | Shown in the EAS dashboard. `auto` uses the commit message or PR title plus the short SHA. |
+| `rollout-percentage` | _(all)_ | Roll out to 1-100% of users. |
+| `update-args` | | Extra `eas update` arguments, e.g. `--clear-cache`. |
+| `environment`, `env`, `doppler-project`, `doppler-config`, `public-env-pattern` | | Same as for builds. |
+| `working-directory`, `node-version`, `package-manager`, `install-command`, `eas-cli-version`, `use-local-cli`, `cache`, `runs-on`, `timeout-minutes`, `ref`, `submodules` | | Same as for builds. |
+
+Outputs: `group-id`, `runtime-version`, `app-version`. Secrets: `EXPO_TOKEN`, `DOPPLER_TOKEN`, `BUILD_ENV`. Updates to one channel are queued, never cancelled mid-publish.
+
+> [!NOTE]
+> With `runtimeVersion: { policy: "fingerprint" }`, an update only reaches builds whose native code matches. If you change native dependencies or config plugins, ship a new build first.
+
+---
+
 ## 🔧 Examples
 
 ### On-demand builds plus tag releases

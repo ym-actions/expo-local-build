@@ -1,0 +1,566 @@
+name: Expo Local Update
+
+# Publishes an over-the-air update with `eas update`, from a GitHub runner. The JS bundle is
+# exported on the runner (not on EAS), so build-time env vars (Doppler, BUILD_ENV, EXPO_PUBLIC_*)
+# are baked in exactly as they are for `expo-local-build`'s main.yml.
+
+on:
+  workflow_call:
+    inputs:
+      # ── What to publish ─────────────────────────────────────────────────────
+      channel:
+        description: "EAS Update channel to publish to (e.g. production, preview, development). Builds made with the same `channel` in eas.json receive the update"
+        required: false
+        default: "production"
+        type: string
+      platform:
+        description: "Platform to publish for: 'all', 'android' or 'ios'"
+        required: false
+        default: "all"
+        type: string
+      message:
+        description: "Update message shown in the EAS dashboard. 'auto' uses the commit message (or PR title) plus the short commit SHA"
+        required: false
+        default: "auto"
+        type: string
+      rollout-percentage:
+        description: "Roll the update out to this percentage of users (1-100). Empty publishes to everyone"
+        required: false
+        default: ""
+        type: string
+      update-args:
+        description: "Extra arguments appended to eas update (e.g. --clear-cache)"
+        required: false
+        default: ""
+        type: string
+      working-directory:
+        description: "Directory containing the Expo app (useful for monorepos)"
+        required: false
+        default: "."
+        type: string
+      environment:
+        description: "GitHub environment to run the job in (enables environment secrets and protection rules)"
+        required: false
+        default: ""
+        type: string
+
+      # ── Build environment ───────────────────────────────────────────────────
+      env:
+        description: "Extra environment variables for the export, one KEY=VALUE per line (non-secret)"
+        required: false
+        default: ""
+        type: string
+      doppler-project:
+        description: "Doppler project to load secrets from. Not needed with a service token (it is scoped to one config)"
+        required: false
+        default: ""
+        type: string
+      doppler-config:
+        description: "Doppler config to load secrets from. Not needed with a service token (it is scoped to one config)"
+        required: false
+        default: ""
+        type: string
+      public-env-pattern:
+        description: "Regex of variable names whose values are NOT masked in logs (they ship inside the app anyway)"
+        required: false
+        default: "^EXPO_PUBLIC_"
+        type: string
+
+      # ── Toolchain ───────────────────────────────────────────────────────────
+      node-version:
+        description: "Node version to use. 'auto' reads .nvmrc / .node-version, falling back to the latest LTS"
+        required: false
+        default: "auto"
+        type: string
+      package-manager:
+        description: "Package manager: 'auto' (detected from packageManager field or lockfile), 'npm', 'pnpm', 'yarn' or 'bun'"
+        required: false
+        default: "auto"
+        type: string
+      install-command:
+        description: "Command to install dependencies. 'auto' uses the detected package manager, 'none' skips it"
+        required: false
+        default: "auto"
+        type: string
+      eas-cli-version:
+        description: "Version of eas-cli to install globally (ignored when a local eas-cli is used)"
+        required: false
+        default: "latest"
+        type: string
+      use-local-cli:
+        description: "Use the eas-cli from the project's own dependencies (node_modules/.bin) instead of installing it globally"
+        required: false
+        default: "false"
+        type: string
+      cache:
+        description: "Cache package manager downloads between runs"
+        required: false
+        default: "true"
+        type: string
+
+      # ── Runner & checkout ───────────────────────────────────────────────────
+      runs-on:
+        description: "Runner label"
+        required: false
+        default: "ubuntu-latest"
+        type: string
+      timeout-minutes:
+        description: "Job timeout in minutes"
+        required: false
+        default: 30
+        type: number
+      ref:
+        description: "Git ref to check out (defaults to the ref that triggered the workflow)"
+        required: false
+        default: ""
+        type: string
+      submodules:
+        description: "Check out submodules: 'false', 'true' or 'recursive'"
+        required: false
+        default: "false"
+        type: string
+
+    secrets:
+      EXPO_TOKEN:
+        description: "Expo access token (expo.dev → Account settings → Access tokens)"
+        required: false
+      DOPPLER_TOKEN:
+        description: "Doppler token. A service token loads its config; a personal or service-account token also needs doppler-project and doppler-config"
+        required: false
+      BUILD_ENV:
+        description: "Secret environment variables for the export, one KEY=VALUE per line (values are masked in logs)"
+        required: false
+
+    outputs:
+      group-id:
+        description: "ID of the published update group"
+        value: ${{ jobs.update.outputs.group-id }}
+      runtime-version:
+        description: "Runtime version the update targets"
+        value: ${{ jobs.update.outputs.runtime-version }}
+      app-version:
+        description: "App version from the Expo config"
+        value: ${{ jobs.update.outputs.app-version }}
+
+jobs:
+  update:
+    name: Update ${{ inputs.channel }} (${{ inputs.platform }})
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    environment: ${{ inputs.environment }}
+
+    # Updates to one channel are published in order, never cancelled mid-flight.
+    concurrency:
+      group: expo-local-update-${{ inputs.channel }}-${{ inputs.working-directory }}
+      cancel-in-progress: false
+
+    env:
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+      EXPO_NO_TELEMETRY: "1"
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+
+    outputs:
+      group-id: ${{ steps.publish.outputs.group }}
+      runtime-version: ${{ steps.publish.outputs.runtime-version }}
+      app-version: ${{ steps.publish.outputs.app-version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          submodules: ${{ inputs.submodules }}
+
+      - name: Resolve Configuration
+        id: config
+        env:
+          HAS_EXPO_TOKEN: ${{ secrets.EXPO_TOKEN != '' }}
+          HAS_DOPPLER_TOKEN: ${{ secrets.DOPPLER_TOKEN != '' }}
+          CHANNEL: ${{ inputs.channel }}
+          PLATFORM: ${{ inputs.platform }}
+          INPUT_MESSAGE: ${{ inputs.message }}
+          ROLLOUT: ${{ inputs.rollout-percentage }}
+          INPUT_NODE_VERSION: ${{ inputs.node-version }}
+          DOPPLER_PROJECT: ${{ inputs.doppler-project }}
+          DOPPLER_CONFIG: ${{ inputs.doppler-config }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+
+          if [ "$HAS_EXPO_TOKEN" != "true" ]; then
+            echo "::error title=Missing EXPO_TOKEN::Pass the EXPO_TOKEN secret to this workflow (see README)."
+            echo "::error::If the caller uses 'secrets: inherit' from another organization, no secrets are passed. Pass them explicitly instead."
+            exit 1
+          fi
+          if { [ -n "$DOPPLER_PROJECT" ] || [ -n "$DOPPLER_CONFIG" ]; } && [ "$HAS_DOPPLER_TOKEN" != "true" ]; then
+            echo "::error title=Missing DOPPLER_TOKEN::doppler-project / doppler-config are set but no DOPPLER_TOKEN secret was passed."
+            exit 1
+          fi
+          if [ -z "$CHANNEL" ]; then
+            echo "::error title=No channel::Set the channel input."
+            exit 1
+          fi
+          case "$PLATFORM" in
+            all|android|ios) ;;
+            *) echo "::error::platform must be 'all', 'android' or 'ios' (got '$PLATFORM')"; exit 1 ;;
+          esac
+          if [ -n "$ROLLOUT" ] && ! [[ "$ROLLOUT" =~ ^[0-9]+$ && "$ROLLOUT" -ge 1 && "$ROLLOUT" -le 100 ]]; then
+            echo "::error::rollout-percentage must be a whole number from 1 to 100 (got '$ROLLOUT')"
+            exit 1
+          fi
+          if [ ! -f eas.json ]; then
+            echo "::error title=eas.json not found::No eas.json in '$PWD'. Check working-directory."
+            exit 1
+          fi
+          # Builds only receive updates for their own channel, so a channel no profile uses
+          # is almost always a typo.
+          if ! jq -e --arg c "$CHANNEL" '[.build[]? | .channel] | index($c)' eas.json >/dev/null; then
+            echo "::warning title=Channel not in eas.json::No build profile in eas.json sets \"channel\": \"$CHANNEL\". Installed apps only receive updates for the channel their build was made with."
+          fi
+
+          SHA="${PR_HEAD_SHA:-$GITHUB_SHA}"
+          if [ "$INPUT_MESSAGE" = "auto" ] || [ -z "$INPUT_MESSAGE" ]; then
+            SUBJECT="${PR_TITLE:-$(printf '%s' "$HEAD_COMMIT_MESSAGE" | head -n1)}"
+            [ -z "$SUBJECT" ] && SUBJECT="$(git log -1 --format=%s)"
+            MESSAGE="$SUBJECT (${SHA:0:7})"
+          else
+            MESSAGE="$INPUT_MESSAGE"
+          fi
+
+          NODE_VERSION=""
+          NODE_VERSION_FILE=""
+          if [ "$INPUT_NODE_VERSION" = "auto" ]; then
+            for f in .nvmrc .node-version "$GITHUB_WORKSPACE/.nvmrc" "$GITHUB_WORKSPACE/.node-version"; do
+              if [ -f "$f" ]; then
+                ABS="$(cd "$(dirname "$f")" && pwd)/$(basename "$f")"
+                NODE_VERSION_FILE="${ABS#"$GITHUB_WORKSPACE"/}"
+                break
+              fi
+            done
+            [ -z "$NODE_VERSION_FILE" ] && NODE_VERSION="lts/*"
+          else
+            NODE_VERSION="$INPUT_NODE_VERSION"
+          fi
+
+          {
+            echo "doppler=$HAS_DOPPLER_TOKEN"
+            echo "sha=$SHA"
+            echo "node-version=$NODE_VERSION"
+            echo "node-version-file=$NODE_VERSION_FILE"
+            echo "started=$(date +%s)"
+            # Multi-line safe: commit messages can contain anything.
+            echo "message<<EOF_MESSAGE"
+            echo "$MESSAGE"
+            echo "EOF_MESSAGE"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Channel:      $CHANNEL"
+          echo "Platform:     $PLATFORM"
+          echo "Message:      $MESSAGE"
+          echo "Rollout:      ${ROLLOUT:-100}%"
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ steps.config.outputs.node-version }}
+          node-version-file: ${{ steps.config.outputs.node-version-file }}
+          package-manager-cache: false
+
+      - name: Detect Package Manager
+        id: pm
+        env:
+          INPUT_PM: ${{ inputs.package-manager }}
+          INPUT_INSTALL: ${{ inputs.install-command }}
+        run: |
+          set -euo pipefail
+
+          find_up() {
+            local dir="$PWD"
+            while :; do
+              [ -f "$dir/$1" ] && { echo "$dir/$1"; return 0; }
+              { [ "$dir" = "$GITHUB_WORKSPACE" ] || [ "$dir" = "/" ]; } && return 1
+              dir="$(dirname "$dir")"
+            done
+          }
+
+          PM_SPEC=""
+          DIR="$PWD"
+          while :; do
+            if [ -f "$DIR/package.json" ]; then
+              PM_SPEC="$(PKG="$DIR/package.json" node -p "require(process.env.PKG).packageManager || ''")"
+              [ -n "$PM_SPEC" ] && break
+            fi
+            { [ "$DIR" = "$GITHUB_WORKSPACE" ] || [ "$DIR" = "/" ]; } && break
+            DIR="$(dirname "$DIR")"
+          done
+
+          if [ "$INPUT_PM" != "auto" ]; then
+            PM="$INPUT_PM"
+          elif [ -n "$PM_SPEC" ]; then
+            PM="${PM_SPEC%%@*}"
+          elif find_up bun.lock >/dev/null || find_up bun.lockb >/dev/null; then
+            PM=bun
+          elif find_up pnpm-lock.yaml >/dev/null; then
+            PM=pnpm
+          elif find_up yarn.lock >/dev/null; then
+            PM=yarn
+          else
+            PM=npm
+          fi
+
+          case "$PM" in
+            npm|pnpm|yarn|bun) ;;
+            *) echo "::error::Unsupported package manager '$PM' (expected npm, pnpm, yarn or bun)"; exit 1 ;;
+          esac
+
+          if [ "$PM" = "pnpm" ] || [ "$PM" = "yarn" ]; then
+            if [ -n "$PM_SPEC" ] && [ "${PM_SPEC%%@*}" = "$PM" ] && corepack enable 2>/dev/null; then
+              echo "Enabled $PM_SPEC via corepack"
+            elif ! command -v "$PM" >/dev/null 2>&1; then
+              echo "Installing $PM globally..."
+              SPEC="$PM"
+              [ "${PM_SPEC%%@*}" = "$PM" ] && SPEC="${PM_SPEC%%+*}"
+              npm install -g "$SPEC" --no-fund --no-audit
+            fi
+          fi
+
+          case "$PM" in
+            npm)  CACHE_DIR="$(npm config get cache)" ;;
+            pnpm) CACHE_DIR="$(pnpm store path --silent)" ;;
+            yarn)
+              if [ "$(yarn --version | cut -d. -f1)" -ge 2 ]; then
+                CACHE_DIR="$(yarn config get cacheFolder)"
+              else
+                CACHE_DIR="$(yarn cache dir)"
+              fi
+              ;;
+            bun)  CACHE_DIR="$HOME/.bun/install/cache" ;;
+          esac
+
+          case "$INPUT_INSTALL" in
+            none|"") INSTALL="" ;;
+            auto)
+              case "$PM" in
+                npm)
+                  if find_up package-lock.json >/dev/null || find_up npm-shrinkwrap.json >/dev/null; then
+                    INSTALL="npm ci"
+                  else
+                    INSTALL="npm install"
+                  fi
+                  ;;
+                pnpm) INSTALL="pnpm install --frozen-lockfile" ;;
+                yarn)
+                  if [ "$(yarn --version | cut -d. -f1)" -ge 2 ]; then
+                    INSTALL="yarn install --immutable"
+                  else
+                    INSTALL="yarn install --frozen-lockfile"
+                  fi
+                  ;;
+                bun) INSTALL="bun install --frozen-lockfile" ;;
+              esac
+              ;;
+            *) INSTALL="$INPUT_INSTALL" ;;
+          esac
+
+          {
+            echo "name=$PM"
+            echo "cache-dir=$CACHE_DIR"
+            echo "install=$INSTALL"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Package manager: $PM${PM_SPEC:+ ($PM_SPEC)}"
+          echo "Install:         ${INSTALL:-<skipped>}"
+
+      - name: Setup Bun
+        if: ${{ steps.pm.outputs.name == 'bun' }}
+        uses: oven-sh/setup-bun@v2
+
+      - name: Cache Dependencies
+        if: ${{ inputs.cache == 'true' && steps.pm.outputs.install != '' }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pm.outputs.cache-dir }}
+          key: ${{ runner.os }}-${{ steps.pm.outputs.name }}-${{ hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json', '**/pnpm-lock.yaml', '**/yarn.lock', '**/bun.lock', '**/bun.lockb') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ steps.pm.outputs.name }}-
+
+      - name: Setup Doppler CLI
+        if: ${{ steps.config.outputs.doppler == 'true' }}
+        uses: dopplerhq/cli-action@v3
+
+      - name: Load Build Environment
+        env:
+          PLAIN_ENV: ${{ inputs.env }}
+          SECRET_ENV: ${{ secrets.BUILD_ENV }}
+          DOPPLER_TOKEN: ${{ secrets.DOPPLER_TOKEN }}
+          DOPPLER_PROJECT: ${{ inputs.doppler-project }}
+          DOPPLER_CONFIG: ${{ inputs.doppler-config }}
+          PUBLIC_PATTERN: ${{ inputs.public-env-pattern }}
+        run: |
+          set -euo pipefail
+
+          # export_var SOURCE MASK KEY VALUE -> available to every later step.
+          export_var() {
+            local source="$1" mask="$2" key="$3" value="$4" delim
+            if [ "$mask" = "true" ] && [ -n "$value" ]; then
+              if [ -z "$PUBLIC_PATTERN" ] || ! [[ "$key" =~ $PUBLIC_PATTERN ]]; then
+                while IFS= read -r part; do
+                  [ -n "$part" ] && echo "::add-mask::$part"
+                done <<< "$value"
+              fi
+            fi
+            delim="EOF_$(openssl rand -hex 8)"
+            printf '%s<<%s\n%s\n%s\n' "$key" "$delim" "$value" "$delim" >> "$GITHUB_ENV"
+            echo "Loaded $key from $source"
+          }
+
+          load_env() {
+            local source="$1" mask="$2" content="$3" line key value
+            [ -z "$content" ] && return 0
+            while IFS= read -r line || [ -n "$line" ]; do
+              line="${line%$'\r'}"
+              [[ -z "${line// }" || "$line" =~ ^[[:space:]]*# ]] && continue
+              line="${line#export }"
+              if [[ ! "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+                echo "::error::Invalid line in $source (expected KEY=VALUE)"
+                exit 1
+              fi
+              key="${BASH_REMATCH[1]}"
+              value="${BASH_REMATCH[2]}"
+              if [[ "$value" =~ ^\"(.*)\"$ || "$value" =~ ^\'(.*)\'$ ]]; then
+                value="${BASH_REMATCH[1]}"
+              fi
+              export_var "$source" "$mask" "$key" "$value"
+            done <<< "$content"
+          }
+
+          # Later sources override earlier ones: Doppler < env input < BUILD_ENV.
+          if [ -n "$DOPPLER_TOKEN" ]; then
+            args=(secrets download --no-file --format json)
+            [ -n "$DOPPLER_PROJECT" ] && args+=(--project "$DOPPLER_PROJECT")
+            [ -n "$DOPPLER_CONFIG" ] && args+=(--config "$DOPPLER_CONFIG")
+            JSON="$(doppler "${args[@]}")"
+            echo "Doppler: $(echo "$JSON" | jq -r '"\(.DOPPLER_PROJECT // "?") / \(.DOPPLER_CONFIG // "?")"')"
+            while IFS= read -r key; do
+              if [[ "$key" == DOPPLER_* ]]; then mask=false; else mask=true; fi
+              export_var "Doppler" "$mask" "$key" "$(echo "$JSON" | jq -r --arg k "$key" '.[$k]')"
+            done < <(echo "$JSON" | jq -r 'keys[]')
+          fi
+          load_env "env input" false "$PLAIN_ENV"
+          load_env "BUILD_ENV secret" true "$SECRET_ENV"
+
+      - name: Install Dependencies
+        if: ${{ steps.pm.outputs.install != '' }}
+        env:
+          INSTALL_COMMAND: ${{ steps.pm.outputs.install }}
+        run: bash -c "$INSTALL_COMMAND"
+
+      - name: Set Up EAS CLI
+        env:
+          CLI_VERSION: ${{ inputs.eas-cli-version }}
+          USE_LOCAL: ${{ inputs.use-local-cli }}
+        run: |
+          set -euo pipefail
+          LOCAL_BIN=""
+          if [ "$USE_LOCAL" = "true" ]; then
+            DIR="$PWD"
+            while :; do
+              if [ -x "$DIR/node_modules/.bin/eas" ]; then
+                LOCAL_BIN="$DIR/node_modules/.bin"
+                break
+              fi
+              { [ "$DIR" = "$GITHUB_WORKSPACE" ] || [ "$DIR" = "/" ]; } && break
+              DIR="$(dirname "$DIR")"
+            done
+          fi
+          if [ -n "$LOCAL_BIN" ]; then
+            echo "$LOCAL_BIN" >> "$GITHUB_PATH"
+            echo "Using local eas-cli from $LOCAL_BIN"
+          else
+            [ "$USE_LOCAL" = "true" ] && echo "::warning title=eas-cli not found locally::use-local-cli is enabled but eas-cli is not in node_modules/.bin, so it is being installed globally."
+            npm install -g "eas-cli@$CLI_VERSION" --no-fund --no-audit
+          fi
+          PATH="${LOCAL_BIN:+$LOCAL_BIN:}$PATH" eas --version
+
+      # Fails in seconds, before exporting, when the app isn't set up for updates.
+      - name: Check Update Configuration
+        id: appconfig
+        run: |
+          set -euo pipefail
+          CONFIG="$(npx expo config --type public --json)"
+          URL="$(echo "$CONFIG" | jq -r '.updates.url // ""')"
+          RUNTIME="$(echo "$CONFIG" | jq -c '.runtimeVersion // ""')"
+          VERSION="$(echo "$CONFIG" | jq -r '.version // ""')"
+          if [ -z "$URL" ] || [ "$RUNTIME" = '""' ]; then
+            echo "::error title=Updates are not configured::The Expo config needs updates.url and runtimeVersion. Run 'eas update:configure', then ship a new native build before publishing updates."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Updates URL:     $URL"
+          echo "Runtime version: $RUNTIME"
+
+      - name: Publish Update
+        id: publish
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          CHANNEL: ${{ inputs.channel }}
+          PLATFORM: ${{ inputs.platform }}
+          MESSAGE: ${{ steps.config.outputs.message }}
+          ROLLOUT: ${{ inputs.rollout-percentage }}
+          UPDATE_ARGS: ${{ inputs.update-args }}
+          APP_VERSION: ${{ steps.appconfig.outputs.version }}
+        run: |
+          set -euo pipefail
+          args=(update --channel "$CHANNEL" --platform "$PLATFORM" --message "$MESSAGE" --non-interactive --json)
+          [ -n "$ROLLOUT" ] && args+=(--rollout-percentage "$ROLLOUT")
+          # shellcheck disable=SC2206
+          [ -n "$UPDATE_ARGS" ] && args+=($UPDATE_ARGS)
+
+          START=$(date +%s)
+          eas "${args[@]}" | tee "$RUNNER_TEMP/eas-update.json"
+          echo "seconds=$(( $(date +%s) - START ))" >> "$GITHUB_OUTPUT"
+
+          # The JSON is the list of updates (one per platform), sharing a group id.
+          GROUP="$(jq -r '[.. | objects | .group? // empty] | first // ""' "$RUNNER_TEMP/eas-update.json" 2>/dev/null || true)"
+          RUNTIME="$(jq -r '[.. | objects | .runtimeVersion? // empty] | first // ""' "$RUNNER_TEMP/eas-update.json" 2>/dev/null || true)"
+          {
+            echo "group=$GROUP"
+            echo "runtime-version=$RUNTIME"
+            echo "app-version=$APP_VERSION"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Write Job Summary
+        if: ${{ always() && steps.publish.outcome == 'success' }}
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          PLATFORM: ${{ inputs.platform }}
+          MESSAGE: ${{ steps.config.outputs.message }}
+          GROUP: ${{ steps.publish.outputs.group }}
+          RUNTIME: ${{ steps.publish.outputs.runtime-version }}
+          VERSION: ${{ steps.publish.outputs.app-version }}
+          ROLLOUT: ${{ inputs.rollout-percentage }}
+          SHA: ${{ steps.config.outputs.sha }}
+          SECONDS_TAKEN: ${{ steps.publish.outputs.seconds }}
+        run: |
+          {
+            echo "### 🚀 Update published to \`$CHANNEL\`"
+            echo ""
+            echo "| | |"
+            echo "| :-- | :-- |"
+            echo "| **Message** | $MESSAGE |"
+            echo "| **Platform** | $PLATFORM |"
+            [ -n "$GROUP" ] && echo "| **Group** | \`$GROUP\` |"
+            [ -n "$RUNTIME" ] && echo "| **Runtime version** | \`$RUNTIME\` |"
+            [ -n "$VERSION" ] && echo "| **App version** | $VERSION |"
+            echo "| **Rollout** | ${ROLLOUT:-100}% |"
+            echo "| **Commit** | \`${SHA:0:7}\` |"
+            echo "| **Publish time** | ${SECONDS_TAKEN:-0}s |"
+            echo ""
+            echo "Installed apps on this channel (with a matching runtime version) fetch it on their next launch and apply it on the launch after."
+          } >> "$GITHUB_STEP_SUMMARY"
