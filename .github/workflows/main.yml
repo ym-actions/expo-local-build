@@ -1022,7 +1022,8 @@ jobs:
 
           echo "::group::eas ${args[*]}"
           BUILD_START=$(date +%s)
-          eas "${args[@]}"
+          # The log is kept for the job summary (Gradle's task profile and totals).
+          eas "${args[@]}" 2>&1 | tee "$RUNNER_TEMP/eas-build.log"
           BUILD_SECONDS=$(( $(date +%s) - BUILD_START ))
           echo "::endgroup::"
           echo "seconds=$BUILD_SECONDS" >> "$GITHUB_OUTPUT"
@@ -1087,6 +1088,65 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
           echo "::notice title=Build complete::$NAME.$TYPE ($SIZE)${VERSION:+, version $VERSION}${VERSION_CODE:+ ($VERSION_CODE)}"
+
+      # Pulls Gradle's task profile and totals out of the EAS log, for the job summary. Best effort:
+      # iOS builds (and Gradle versions that print nothing) just produce no report.
+      - name: Collect Build Report
+        id: report
+        if: ${{ always() && steps.build.outcome != 'skipped' }}
+        continue-on-error: true
+        run: |
+          LOG="$RUNNER_TEMP/eas-build.log"
+          OUT="$RUNNER_TEMP/build-report.md"
+          : > "$OUT"
+          [ -s "$LOG" ] || exit 0
+
+          # Drop colour codes and the "[PHASE] " prefix EAS puts on each line.
+          CLEAN="$RUNNER_TEMP/eas-build.clean.log"
+          perl -pe 's/\e\[[0-9;]*[A-Za-z]//g; s/^\s*(?:\[[A-Z0-9_]+\]\s?)?//' "$LOG" > "$CLEAN"
+
+          TABLE="$(awk '/Task Execution Profile/ {p=1} p {print} p && /^└/ {exit}' "$CLEAN")"
+          TASKS_LINE="$(grep -E '[0-9]+ actionable tasks?:' "$CLEAN" | tail -n1 || true)"
+          PROFILE_LINE="$(grep -E '^[0-9]+ tasks \(.*total task time:' "$CLEAN" | tail -n1 || true)"
+          # "BUILD SUCCESSFUL in 10m 54s": the time can be on the same line or the next one.
+          GRADLE_TIME="$(awk '
+            /BUILD (SUCCESSFUL|FAILED)/ { found = 1; if (match($0, / in [0-9hms ]+$/)) { print substr($0, RSTART + 4); exit } next }
+            found && /^in [0-9hms ]+$/ { print substr($0, 4); exit }
+            found && NF { exit }' "$CLEAN")"
+
+          [ -z "$TABLE$TASKS_LINE$GRADLE_TIME" ] && exit 0
+
+          num() { echo "$TASKS_LINE" | sed -nE "s/.*[^0-9]([0-9]+) $1.*/\1/p" | head -n1; }
+          TOTAL="$(echo "$TASKS_LINE" | grep -Eo '[0-9]+ actionable' | grep -Eo '^[0-9]+' | head -n1 || true)"
+          EXECUTED="$(num executed)"; CACHED="$(num 'from cache')"; UPTODATE="$(num up-to-date)"
+
+          {
+            echo "#### 🐘 Gradle"
+            echo ""
+            echo "| | |"
+            echo "| :-- | :-- |"
+            [ -n "$GRADLE_TIME" ] && echo "| **Gradle build** | $GRADLE_TIME |"
+            if [ -n "$TOTAL" ]; then
+              DETAIL="${EXECUTED:-0} executed, ${CACHED:-0} from cache${UPTODATE:+, $UPTODATE up-to-date}"
+              REUSED=$(( ${CACHED:-0} + ${UPTODATE:-0} ))
+              [ "$TOTAL" -gt 0 ] && DETAIL="$DETAIL ($(( REUSED * 100 / TOTAL ))% reused)"
+              echo "| **Tasks** | $TOTAL actionable: $DETAIL |"
+            fi
+            [ -n "$PROFILE_LINE" ] && echo "| **Task execution** | $PROFILE_LINE |"
+            echo ""
+            if [ -n "$TABLE" ]; then
+              echo "<details open><summary>Task execution profile</summary>"
+              echo ""
+              echo '```text'
+              echo "$TABLE"
+              echo '```'
+              echo ""
+              echo "</details>"
+              echo ""
+            fi
+          } >> "$OUT"
+          echo "has-report=true" >> "$GITHUB_OUTPUT"
+          echo "Collected build report ($(wc -l < "$OUT") lines)"
 
       - name: Collect Cache Stats
         id: cache-stats
@@ -1348,6 +1408,7 @@ jobs:
           CCACHE_HITS: ${{ steps.cache-stats.outputs.ccache-hits }}
           CCACHE_TOTAL: ${{ steps.cache-stats.outputs.ccache-total }}
           CCACHE_SIZE: ${{ steps.cache-stats.outputs.ccache-size }}
+          HAS_REPORT: ${{ steps.report.outputs.has-report }}
         run: |
           fmt() { printf '%dm %02ds' $(( $1 / 60 )) $(( $1 % 60 )); }
           TOTAL_SECONDS=$(( $(date +%s) - STARTED ))
@@ -1383,6 +1444,11 @@ jobs:
             [ -n "$CCACHE_RATE" ] && echo "| **ccache** | $CCACHE_RATE hit rate ($CCACHE_HITS / $CCACHE_TOTAL compilations), $CCACHE_SIZE |"
             echo "| **Caches saved** | $([ "$CACHE_READ_ONLY" = "true" ] && echo "no (restore only, see \`cache-read-only\`)" || echo "yes") |"
           } >> "$GITHUB_STEP_SUMMARY"
+          # Gradle's totals and task profile, when the log had them.
+          if [ "$HAS_REPORT" = "true" ] && [ -s "$RUNNER_TEMP/build-report.md" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            cat "$RUNNER_TEMP/build-report.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Report EAS CLI Fallback
         if: ${{ always() && steps.cli.outputs.source == 'global-fallback' }}

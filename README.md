@@ -357,6 +357,8 @@ The Expo / React Native template sets `-Xmx2048m -XX:MaxMetaspaceSize=512m`. Tha
 
 Each run's summary includes the `eas build` duration, the whole job's duration, the ABIs built, Gradle cache sizes, the ccache hit rate, and whether caches were saved. Compare a few runs before and after changing a setting.
 
+Android builds also add a **Gradle** section, taken from the `eas build` log: the Gradle build time, how many of the actionable tasks were executed, restored from the build cache or already up to date, and Gradle's full task execution profile table (which tasks took the longest). Use it to see where build time goes, for example a task that is always `executed` and never `from-cache`. iOS builds, or runs where Gradle prints nothing, skip this section.
+
 ---
 
 ## 🚀 Over-the-Air Updates
