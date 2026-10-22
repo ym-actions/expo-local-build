@@ -312,7 +312,7 @@ jobs:
     outputs:
       artifact-path: ${{ steps.build.outputs.path }}
       artifact-name: ${{ steps.build.outputs.name }}
-      artifact-url: ${{ steps.upload.outputs.artifact-url }}
+      artifact-url: ${{ steps.upload.outputs.artifact-url || steps.upload-fallback.outputs.artifact-url }}
       build-type: ${{ steps.build.outputs.type }}
       app-version: ${{ steps.build.outputs.version }}
       release-url: ${{ steps.release.outputs.url }}
@@ -1379,6 +1379,19 @@ jobs:
           echo "::endgroup::"
           echo "track=$NAME" >> "$GITHUB_OUTPUT"
 
+      # Fallback: the build succeeded but Firebase or the store rejected it. Keep the
+      # binary as a workflow artifact even if upload-artifact is off, so it isn't lost.
+      - name: Upload Artifact (Fallback)
+        id: upload-fallback
+        if: ${{ always() && inputs.upload-artifact != 'true' && steps.build.outcome == 'success' && (steps.firebase.outcome == 'failure' || steps.submit.outcome == 'failure') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build.outputs.name }}
+          path: ${{ github.workspace }}/${{ steps.build.outputs.path }}
+          retention-days: ${{ inputs.retention-days }}
+          if-no-files-found: error
+          compression-level: 0
+
       - name: Write Job Summary
         if: ${{ always() && steps.build.outcome == 'success' }}
         env:
@@ -1387,7 +1400,8 @@ jobs:
           SIZE: ${{ steps.build.outputs.size }}
           VERSION: ${{ steps.build.outputs.version }}
           PROFILE: ${{ inputs.profile }}
-          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url || steps.upload-fallback.outputs.artifact-url }}
+          FALLBACK_UPLOAD: ${{ steps.upload-fallback.outputs.artifact-url }}
           RELEASE_URL: ${{ steps.release.outputs.url }}
           SUBMITTED: ${{ steps.submit.outcome == 'success' }}
           SUBMITTED_TRACK: ${{ steps.submit.outputs.track }}
@@ -1420,7 +1434,7 @@ jobs:
             echo "| **File** | \`$FILE_NAME\` ($SIZE) |"
             echo "| **Profile** | \`$PROFILE\` |"
             [ -n "$VERSION" ] && echo "| **Version** | $VERSION${VERSION_CODE:+ ($VERSION_CODE)} |"
-            [ -n "$ARTIFACT_URL" ] && echo "| **Download** | [Workflow artifact]($ARTIFACT_URL) |"
+            [ -n "$ARTIFACT_URL" ] && echo "| **Download** | [Workflow artifact]($ARTIFACT_URL)${FALLBACK_UPLOAD:+ (uploaded as a fallback because distribution failed)} |"
             [ -n "$RELEASE_URL" ] && echo "| **Release** | $RELEASE_URL |"
             if [ "$FIREBASE_OUTCOME" = "success" ]; then
               LINKS=""
@@ -1477,7 +1491,7 @@ jobs:
           SIZE: ${{ steps.build.outputs.size }}
           VERSION: ${{ steps.build.outputs.version }}
           VERSION_CODE: ${{ steps.build.outputs.version-code }}
-          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url || steps.upload-fallback.outputs.artifact-url }}
           FIREBASE_TESTING: ${{ steps.firebase.outputs.testing-url }}
           SHA: ${{ steps.config.outputs.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
