@@ -44,6 +44,11 @@ on:
         default: ""
         type: string
 
+      sentry-sourcemaps:
+        description: "Upload the update's source maps to Sentry after publishing: 'auto' (when a Sentry auth token is available), 'true' (fail the job if the upload can't happen) or 'false'"
+        required: false
+        default: "auto"
+        type: string
       # ── Build environment ───────────────────────────────────────────────────
       env:
         description: "Extra environment variables for the export, one KEY=VALUE per line (non-secret)"
@@ -129,6 +134,9 @@ on:
         required: false
       BUILD_ENV:
         description: "Secret environment variables for the export, one KEY=VALUE per line (values are masked in logs)"
+        required: false
+      SENTRY_AUTH_TOKEN:
+        description: "Sentry auth token. Loaded into the environment like a BUILD_ENV line, and used to upload the update's source maps (see sentry-sourcemaps). Can also come from Doppler / BUILD_ENV"
         required: false
 
     outputs:
@@ -398,6 +406,7 @@ jobs:
         env:
           PLAIN_ENV: ${{ inputs.env }}
           SECRET_ENV: ${{ secrets.BUILD_ENV }}
+          SENTRY_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
           DOPPLER_TOKEN: ${{ secrets.DOPPLER_TOKEN }}
           DOPPLER_PROJECT: ${{ inputs.doppler-project }}
           DOPPLER_CONFIG: ${{ inputs.doppler-config }}
@@ -440,7 +449,7 @@ jobs:
             done <<< "$content"
           }
 
-          # Later sources override earlier ones: Doppler < env input < BUILD_ENV.
+          # Later sources override earlier ones: Doppler < env input < BUILD_ENV < SENTRY_AUTH_TOKEN secret.
           if [ -n "$DOPPLER_TOKEN" ]; then
             args=(secrets download --no-file --format json)
             [ -n "$DOPPLER_PROJECT" ] && args+=(--project "$DOPPLER_PROJECT")
@@ -454,6 +463,7 @@ jobs:
           fi
           load_env "env input" false "$PLAIN_ENV"
           load_env "BUILD_ENV secret" true "$SECRET_ENV"
+          if [ -n "$SENTRY_TOKEN" ]; then export_var "SENTRY_AUTH_TOKEN secret" true SENTRY_AUTH_TOKEN "$SENTRY_TOKEN"; fi
 
       - name: Install Dependencies
         if: ${{ steps.pm.outputs.install != '' }}
@@ -535,6 +545,49 @@ jobs:
             echo "app-version=$APP_VERSION"
           } >> "$GITHUB_OUTPUT"
 
+      # Sentry needs the exported bundles' source maps to show readable stack traces for crashes in
+      # this update. `eas update` leaves them in its input dir (dist/ unless --input-dir is passed).
+      - name: Upload Source Maps to Sentry
+        id: sentry
+        if: ${{ steps.publish.outcome == 'success' && inputs.sentry-sourcemaps != 'false' }}
+        env:
+          MODE: ${{ inputs.sentry-sourcemaps }}
+          UPDATE_ARGS: ${{ inputs.update-args }}
+        run: |
+          set -uo pipefail
+          # skip REASON: fine in 'auto' mode, an error with 'true'.
+          skip() {
+            echo "result=skipped" >> "$GITHUB_OUTPUT"
+            if [ "$MODE" = "true" ]; then echo "::error title=Sentry source maps not uploaded::$1"; exit 1; fi
+            echo "Skipping Sentry source maps: $1"
+            exit 0
+          }
+          [ -n "${SENTRY_AUTH_TOKEN:-}" ] || skip "no SENTRY_AUTH_TOKEN (pass the secret, or add it to Doppler / BUILD_ENV)."
+
+          DIR=dist
+          if [[ " $UPDATE_ARGS " =~ [[:space:]]--input-dir[=[:space:]]+([^[:space:]]+) ]]; then DIR="${BASH_REMATCH[1]}"; fi
+          [ -d "$DIR" ] || skip "the export folder '$DIR' wasn't found."
+          if [ -z "$(find "$DIR" -name '*.map' -print -quit)" ]; then skip "no source maps in '$DIR' (were they turned off with --source-maps false?)."; fi
+
+          # The uploader ships with @sentry/react-native (8.9+); fall back to the standalone package.
+          BIN=""
+          D="$PWD"
+          while :; do
+            [ -x "$D/node_modules/.bin/sentry-expo-upload-sourcemaps" ] && { BIN="$D/node_modules/.bin/sentry-expo-upload-sourcemaps"; break; }
+            { [ "$D" = "$GITHUB_WORKSPACE" ] || [ "$D" = "/" ]; } && break
+            D="$(dirname "$D")"
+          done
+          if [ -n "$BIN" ]; then CMD=("$BIN" "$DIR"); else CMD=(npx --yes @sentry/expo-upload-sourcemaps "$DIR"); fi
+
+          echo "Uploading source maps from $DIR (org: ${SENTRY_ORG:-from app config}, project: ${SENTRY_PROJECT:-from app config})"
+          if "${CMD[@]}"; then
+            echo "result=uploaded" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=failed" >> "$GITHUB_OUTPUT"
+            if [ "$MODE" = "true" ]; then echo "::error title=Sentry upload failed::The update was published, but its source maps didn't upload. Check SENTRY_AUTH_TOKEN, SENTRY_ORG and SENTRY_PROJECT."; exit 1; fi
+            echo "::warning title=Sentry upload failed::The update was published, but its source maps didn't upload, so its crash stack traces will be minified. Check SENTRY_AUTH_TOKEN, SENTRY_ORG and SENTRY_PROJECT."
+          fi
+
       - name: Write Job Summary
         if: ${{ always() && steps.publish.outcome == 'success' }}
         env:
@@ -547,6 +600,7 @@ jobs:
           ROLLOUT: ${{ inputs.rollout-percentage }}
           SHA: ${{ steps.config.outputs.sha }}
           SECONDS_TAKEN: ${{ steps.publish.outputs.seconds }}
+          SENTRY_RESULT: ${{ steps.sentry.outputs.result }}
         run: |
           {
             echo "### 🚀 Update published to \`$CHANNEL\`"
@@ -561,6 +615,11 @@ jobs:
             echo "| **Rollout** | ${ROLLOUT:-100}% |"
             echo "| **Commit** | \`${SHA:0:7}\` |"
             echo "| **Publish time** | ${SECONDS_TAKEN:-0}s |"
+            case "$SENTRY_RESULT" in
+              uploaded) echo "| **Sentry source maps** | ✅ uploaded |" ;;
+              failed)   echo "| **Sentry source maps** | ⚠️ upload failed |" ;;
+              skipped)  echo "| **Sentry source maps** | skipped |" ;;
+            esac
             echo ""
             echo "Installed apps on this channel (with a matching runtime version) fetch it on their next launch and apply it on the launch after."
           } >> "$GITHUB_STEP_SUMMARY"

@@ -244,6 +244,9 @@ on:
       BUILD_ENV:
         description: "Secret build-time environment variables, one KEY=VALUE per line (values are masked in logs)"
         required: false
+      SENTRY_AUTH_TOKEN:
+        description: "Sentry auth token, loaded into the build environment like a BUILD_ENV line (Sentry's config plugin uploads source maps during release builds). Can also come from Doppler / BUILD_ENV"
+        required: false
       PLAY_SERVICE_ACCOUNT:
         description: "JSON key of a Google Play service account (Release manager). Optional: without it, eas submit uses the key stored on EAS (eas credentials)"
         required: false
@@ -698,6 +701,7 @@ jobs:
         env:
           PLAIN_ENV: ${{ inputs.env }}
           SECRET_ENV: ${{ secrets.BUILD_ENV }}
+          SENTRY_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
           DOPPLER_TOKEN: ${{ secrets.DOPPLER_TOKEN }}
           DOPPLER_PROJECT: ${{ inputs.doppler-project }}
           DOPPLER_CONFIG: ${{ inputs.doppler-config }}
@@ -743,7 +747,7 @@ jobs:
             done <<< "$content"
           }
 
-          # Later sources override earlier ones: Doppler < env input < BUILD_ENV.
+          # Later sources override earlier ones: Doppler < env input < BUILD_ENV < SENTRY_AUTH_TOKEN secret.
           if [ -n "$DOPPLER_TOKEN" ]; then
             args=(secrets download --no-file --format json)
             [ -n "$DOPPLER_PROJECT" ] && args+=(--project "$DOPPLER_PROJECT")
@@ -758,6 +762,7 @@ jobs:
           fi
           load_env "env input" false "$PLAIN_ENV"
           load_env "BUILD_ENV secret" true "$SECRET_ENV"
+          if [ -n "$SENTRY_TOKEN" ]; then export_var "SENTRY_AUTH_TOKEN secret" true SENTRY_AUTH_TOKEN "$SENTRY_TOKEN"; fi
 
       - name: Configure Native Build
         env:

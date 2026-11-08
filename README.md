@@ -19,6 +19,8 @@
 - 🏗️ **EAS Builds Without the Queue:** Runs `eas build --local` with your `eas.json` profiles. Signing credentials and remote app versions still come from EAS, but the build runs on a GitHub runner and doesn't use your EAS build quota.
 - 🎛️ **Any Profile, Either Platform:** Build `development`, `preview`, `production` or any custom profile, for Android (Linux runner) or iOS (macOS runner, selected automatically).
 - 🔐 **Doppler Built In:** Pass a `DOPPLER_TOKEN` and every secret in the config becomes a build-time env var, masked in the logs. This covers EAS variables with "Secret" visibility, which `eas build --local` [can't read](https://docs.expo.dev/build-reference/local-builds/).
+- 🧩 **Secrets One at a Time:** Keep each secret in its own repository secret and [append it to `BUILD_ENV`](#passing-secrets-one-at-a-time) in the caller, instead of maintaining one big secret you can't read back.
+- 🐛 **Sentry Source Maps:** Pass `SENTRY_AUTH_TOKEN` and release builds upload their source maps; OTA updates upload theirs right after publishing.
 - 🌍 **One Token per Environment:** Combine `environment` with GitHub environment secrets so each profile loads its own Doppler config, and production can require an approval.
 - 📦 **Ready-to-Share Binaries:** Uploads the `.apk` / `.aab` / `.ipa` as a nicely named workflow artifact. It can also attach it to a GitHub Release, or hand it to `eas submit`.
 - 🔥 **Firebase App Distribution:** Send builds straight to your testers. The Firebase app ID is found automatically from `google-services.json` / `GoogleService-Info.plist`, for the package each profile builds.
@@ -114,8 +116,28 @@ Your app config and native build often need secrets: a Sentry auth token, API ke
 1. **Doppler**, when a `DOPPLER_TOKEN` secret is passed. A [service token](https://docs.doppler.com/docs/service-tokens) is scoped to a single config, so nothing else is needed. With a personal or service-account token, also set `doppler-project` and `doppler-config`.
 2. The **`env` input**: non-secret `KEY=VALUE` lines.
 3. The **`BUILD_ENV` secret**: secret `KEY=VALUE` lines.
+4. Named secrets this workflow knows about, such as **`SENTRY_AUTH_TOKEN`** (see [Sentry](#-sentry-source-maps)).
 
-Every value from Doppler and `BUILD_ENV` is masked in the logs, except for variables matching `public-env-pattern` (by default `^EXPO_PUBLIC_`). Those values ship inside the app anyway, and masking them would only make the logs harder to read.
+Every value from Doppler, `BUILD_ENV` and named secrets is masked in the logs, except for variables matching `public-env-pattern` (by default `^EXPO_PUBLIC_`). Those values ship inside the app anyway, and masking them would only make the logs harder to read.
+
+### Passing secrets one at a time
+
+A reusable workflow only receives the secrets it declares, so you can't pass `MY_API_KEY` directly. You also can't read a secret back once it's saved, which makes editing a big `BUILD_ENV` secret painful. Instead, keep each value in its own repository secret and **build `BUILD_ENV` in the caller**:
+
+```yaml
+    secrets:
+      EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+      BUILD_ENV: |
+        ${{ secrets.BUILD_ENV }}
+        MY_API_KEY=${{ secrets.MY_API_KEY }}
+        ANOTHER_SECRET=${{ secrets.ANOTHER_SECRET }}
+```
+
+- The first line keeps whatever is already in a `BUILD_ENV` secret (drop it if you don't have one). You never need to see or retype those values.
+- Each `NAME=${{ secrets.NAME }}` line adds one secret. Values are masked in the logs like any `BUILD_ENV` value.
+- Blank lines and `#` comments are ignored, and a later line wins over an earlier one with the same name.
+- A secret that doesn't exist becomes an empty value (`NAME=`), which **overrides** a value for the same name from Doppler, the `env` input or earlier `BUILD_ENV` lines. Only list secrets you've actually created.
+- Multi-line secret values (JSON keys, PEM files) don't fit on one line. Pass them in their own declared secret (e.g. `PLAY_SERVICE_ACCOUNT`) or through Doppler.
 
 ### One Doppler config per profile
 
@@ -238,7 +260,8 @@ See [Firebase App Distribution](#-firebase-app-distribution) for setup.
 | :-------------- | :------- | :------------------------------------------------------------------------------------------------------- |
 | `EXPO_TOKEN`    | Yes\*    | Expo access token.                                                                                       |
 | `DOPPLER_TOKEN` | No       | Doppler token. Its config's secrets are loaded as build-time env vars (see [Build Environment](#-build-environment--doppler)). |
-| `BUILD_ENV`     | No       | **Secret** build-time env vars, one `KEY=VALUE` per line. Every value is masked in the logs.             |
+| `BUILD_ENV`     | No       | **Secret** build-time env vars, one `KEY=VALUE` per line. Every value is masked in the logs. To pass repository secrets one by one, see [Passing secrets one at a time](#passing-secrets-one-at-a-time). |
+| `SENTRY_AUTH_TOKEN` | No   | Sentry auth token, loaded into the build environment (masked). With Sentry's Expo config plugin, release builds upload their source maps. See [Sentry](#-sentry-source-maps). |
 | `PLAY_SERVICE_ACCOUNT` | No | JSON key of a Google Play service account. Without it, `eas submit` uses the key stored on EAS. |
 | `FIREBASE_SERVICE_ACCOUNT` | With `firebase-distribute` | JSON key of a service account with the **Firebase App Distribution Admin** role. It can also be a `FIREBASE_SERVICE_ACCOUNT` variable in Doppler or `BUILD_ENV`. |
 
@@ -405,67 +428,37 @@ Before the first update, your app needs `updates.url`, a `runtimeVersion` and a 
 | `message` | `auto` | Shown in the EAS dashboard. `auto` uses the commit message or PR title plus the short SHA. |
 | `rollout-percentage` | _(all)_ | Roll out to 1-100% of users. |
 | `update-args` | | Extra `eas update` arguments, e.g. `--clear-cache`. |
+| `sentry-sourcemaps` | `auto` | Upload the update's source maps to Sentry after publishing. `auto`: when a Sentry auth token is available, and a failed upload is only a warning (the update is already live). `true`: fail the job if the upload can't happen. `false`: never. |
 | `environment`, `env`, `doppler-project`, `doppler-config`, `public-env-pattern` | | Same as for builds. |
 | `working-directory`, `node-version`, `package-manager`, `install-command`, `eas-cli-version`, `use-local-cli`, `cache`, `runs-on`, `timeout-minutes`, `ref`, `submodules` | | Same as for builds. |
 
-Outputs: `group-id`, `runtime-version`, `app-version`. Secrets: `EXPO_TOKEN`, `DOPPLER_TOKEN`, `BUILD_ENV`. Updates to one channel are queued, never cancelled mid-publish.
+Outputs: `group-id`, `runtime-version`, `app-version`. Secrets: `EXPO_TOKEN`, `DOPPLER_TOKEN`, `BUILD_ENV`, `SENTRY_AUTH_TOKEN`. Updates to one channel are queued, never cancelled mid-publish.
 
 > [!NOTE]
 > With `runtimeVersion: { policy: "fingerprint" }`, an update only reaches builds whose native code matches. If you change native dependencies or config plugins, ship a new build first.
 
 ---
 
-## 🚀 Over-the-Air Updates
+## 🐛 Sentry Source Maps
 
-`update.yml` publishes an [EAS Update](https://docs.expo.dev/eas-update/introduction/) from a GitHub runner, so JS-only changes reach installed apps without a new build. It loads the same Doppler / `BUILD_ENV` variables as `main.yml`, so `EXPO_PUBLIC_*` values are baked into the update exactly as they are into a build.
+With source maps, Sentry shows crashes against your original code instead of the minified bundle. Pass a `SENTRY_AUTH_TOKEN` secret to both workflows:
 
 ```yaml
-name: Update
-
-on:
-  workflow_dispatch:
-    inputs:
-      channel:
-        type: choice
-        options: [development, preview, production]
-        default: preview
-      platform:
-        type: choice
-        options: [all, android, ios]
-        default: all
-      message:
-        description: Update message (empty uses the latest commit)
-        default: ""
-
-jobs:
-  update:
-    uses: ym-actions/expo-local-build/.github/workflows/update.yml@1.x
-    with:
-      channel: ${{ inputs.channel }}
-      platform: ${{ inputs.platform }}
-      message: ${{ inputs.message || 'auto' }}
-      environment: ${{ inputs.channel }}
     secrets:
       EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
-      DOPPLER_TOKEN: ${{ secrets.DOPPLER_TOKEN }}
+      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
 ```
 
-Before the first update, your app needs `updates.url`, a `runtimeVersion` and a `channel` on each `eas.json` build profile (`eas update:configure` sets them up), and installed builds must have been made with that config. The workflow checks the Expo config first and fails in seconds when it is missing.
+- **Builds (`main.yml`):** the token is loaded into the build environment, and Sentry's Expo config plugin (`@sentry/react-native/expo`) uploads the source maps during release builds. Debug builds don't upload.
+- **Updates (`update.yml`):** right after `eas update` publishes, the workflow uploads the source maps it exported (from `dist/`, or the folder given with `--input-dir` in `update-args`) using `sentry-expo-upload-sourcemaps` from `@sentry/react-native` (8.9+), or `npx @sentry/expo-upload-sourcemaps` when it isn't installed. The job summary shows whether it worked.
+- **Org and project:** the uploader reads `SENTRY_ORG` and `SENTRY_PROJECT` from the environment, from the project's `.env` files, or from the Sentry plugin's `organization` / `project` options in the Expo config. The slugs aren't secret: put them in `.env`, the `env` input or the plugin config.
+- **Creating the token:** in Sentry, *Settings → Developer Settings → Organization Tokens*.
+- **Without a token** nothing is uploaded and nothing fails (unless `sentry-sourcemaps: "true"`). If your app adds the Sentry config plugin only when a token is present, builds without one still succeed.
 
-| Input | Default | Description |
-| :-- | :-- | :-- |
-| `channel` | `production` | Channel to publish to. Builds receive updates for the channel set in their `eas.json` profile. A channel no profile uses gets a warning. |
-| `platform` | `all` | `all`, `android` or `ios`. |
-| `message` | `auto` | Shown in the EAS dashboard. `auto` uses the commit message or PR title plus the short SHA. |
-| `rollout-percentage` | _(all)_ | Roll out to 1-100% of users. |
-| `update-args` | | Extra `eas update` arguments, e.g. `--clear-cache`. |
-| `environment`, `env`, `doppler-project`, `doppler-config`, `public-env-pattern` | | Same as for builds. |
-| `working-directory`, `node-version`, `package-manager`, `install-command`, `eas-cli-version`, `use-local-cli`, `cache`, `runs-on`, `timeout-minutes`, `ref`, `submodules` | | Same as for builds. |
+The token can also come from Doppler or a `BUILD_ENV` line instead of its own secret.
 
-Outputs: `group-id`, `runtime-version`, `app-version`. Secrets: `EXPO_TOKEN`, `DOPPLER_TOKEN`, `BUILD_ENV`. Updates to one channel are queued, never cancelled mid-publish.
-
-> [!NOTE]
-> With `runtimeVersion: { policy: "fingerprint" }`, an update only reaches builds whose native code matches. If you change native dependencies or config plugins, ship a new build first.
+> [!WARNING]
+> EAS environment variables with **Secret** visibility can't be read by local builds, so a `SENTRY_AUTH_TOKEN` kept only there makes release builds fail with *Auth token is required*. Pass it to this workflow instead.
 
 ---
 
@@ -631,7 +624,7 @@ Keep `free-disk-space: "true"` (the default), and consider building fewer ABIs w
 
 ### A variable works in EAS cloud builds but is empty here
 
-It's probably an EAS environment variable with **Secret** visibility, which local builds can't read. Put it in Doppler or `BUILD_ENV` instead.
+It's probably an EAS environment variable with **Secret** visibility, which local builds can't read. Put it in Doppler or `BUILD_ENV` instead. A single repository secret works too: append it to `BUILD_ENV` in the caller (see [Passing secrets one at a time](#passing-secrets-one-at-a-time)).
 
 ### Versioning
 
