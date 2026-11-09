@@ -222,6 +222,7 @@ See [Making Builds Faster](#-making-builds-faster) for how these fit together.
 | `release-tag`     | Release tag to attach to.                                                                                    | triggering tag |
 | `submit`          | Run `eas submit` with the built binary. The submission itself runs on EAS servers.                           | `"false"` |
 | `submit-profile`  | Submit profile from `eas.json`.                                                                              | `profile` |
+| `submit-timeout-minutes` | Max minutes to wait for `eas submit`. If EAS has it queued longer, the step stops waiting, succeeds, and the job summary links to the submission to monitor. `0` = no limit. | `"5"` |
 | `submit-track`    | Google Play track to submit to (Android, needs `submit`): `internal`, `closed`, `open`, `production`, or a custom track name. See [Google Play tracks](#google-play-tracks). | `""` (profile's track) |
 | `submit-release-status` | `completed`, `draft`, `halted` or `inProgress` for `submit-track`. Use `draft` for an app that has never been released. | profile's, else `completed` |
 

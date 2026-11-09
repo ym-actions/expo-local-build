@@ -157,6 +157,11 @@ on:
         required: false
         default: ""
         type: string
+      submit-timeout-minutes:
+        description: "Max minutes to wait for eas submit. EAS submissions are normally done in a few minutes, but can sit in the queue for a long time. When the limit is hit, the step stops waiting and succeeds (the submission stays queued on EAS) and the summary links to it. 0 waits without limit"
+        required: false
+        default: "5"
+        type: string
       submit-track:
         description: "Google Play track to submit to: internal, closed, open, production (or a custom track name). Google Play accepts a version code on one track only, so it is one build per track. Empty keeps the track set in the submit profile. Android only"
         required: false
@@ -1314,14 +1319,54 @@ jobs:
           SUBMIT_PROFILE: ${{ inputs.submit-profile || inputs.profile }}
           TRACK_INPUT: ${{ inputs.submit-track }}
           RELEASE_STATUS: ${{ inputs.submit-release-status }}
+          SUBMIT_TIMEOUT_MIN: ${{ inputs.submit-timeout-minutes }}
           FILE: ${{ github.workspace }}/${{ steps.build.outputs.path }}
           FILE_TYPE: ${{ steps.build.outputs.type }}
         run: |
           set -euo pipefail
 
+          # Runs eas submit, waiting at most SUBMIT_TIMEOUT_MIN minutes (portable: macOS has
+          # no `timeout`). Returns 0 on success, 124 when the limit was hit (the submission
+          # keeps going on EAS servers), or eas's own exit code on failure.
+          SUBMIT_LOG="$RUNNER_TEMP/eas-submit.log"
+          run_submit() {
+            : > "$SUBMIT_LOG"
+            local limit=$(( ${SUBMIT_TIMEOUT_MIN:-0} * 60 )) waited=0
+            eas submit "$@" > "$SUBMIT_LOG" 2>&1 &
+            local pid=$! tailpid
+            tail -n +1 -f "$SUBMIT_LOG" &
+            tailpid=$!
+            while kill -0 "$pid" 2>/dev/null; do
+              if [ "$limit" -gt 0 ] && [ "$waited" -ge "$limit" ]; then
+                pkill -TERM -P "$pid" 2>/dev/null || true
+                kill -TERM "$pid" 2>/dev/null || true
+                sleep 2
+                kill -KILL "$pid" 2>/dev/null || true
+                sleep 1; kill "$tailpid" 2>/dev/null || true
+                return 124
+              fi
+              sleep 2; waited=$(( waited + 2 ))
+            done
+            local rc=0
+            wait "$pid" || rc=$?
+            sleep 1; kill "$tailpid" 2>/dev/null || true
+            return "$rc"
+          }
+
+          # Called when the wait limit was hit: not a failure, the submission is just queued.
+          handle_timeout() {
+            local url
+            url="$(sed -E 's/\x1b\[[0-9;]*m//g' "$SUBMIT_LOG" | grep -oE 'https://expo\.dev/accounts/[^ ]+/submissions/[A-Za-z0-9-]+' | head -n1 || true)"
+            echo "queued=true" >> "$GITHUB_OUTPUT"
+            echo "queue-url=${url:-https://expo.dev}" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Submission still queued::eas submit did not finish within ${SUBMIT_TIMEOUT_MIN} min. It is probably queued on EAS, so the job stopped waiting to save runner time. Monitor it: ${url:-the Submissions page of your project on expo.dev}"
+          }
+
           if [ -z "$TRACK_INPUT" ]; then
-            eas submit --non-interactive --platform "$PLATFORM" --profile "$SUBMIT_PROFILE" --path "$FILE"
-            exit 0
+            rc=0
+            run_submit --non-interactive --platform "$PLATFORM" --profile "$SUBMIT_PROFILE" --path "$FILE" || rc=$?
+            if [ "$rc" -eq 124 ]; then handle_timeout; exit 0; fi
+            exit "$rc"
           fi
 
           if [ "$PLATFORM" != "android" ]; then
@@ -1376,7 +1421,15 @@ jobs:
           ' "$RUNNER_TEMP/eas.json.orig" > eas.json
 
           echo "::group::Submit to Google Play: $NAME (track: $TRACK)"
-          if ! eas submit --non-interactive --platform android --profile "$TMP_PROFILE" --path "$FILE"; then
+          rc=0
+          run_submit --non-interactive --platform android --profile "$TMP_PROFILE" --path "$FILE" || rc=$?
+          if [ "$rc" -eq 124 ]; then
+            echo "::endgroup::"
+            handle_timeout
+            echo "track=$NAME" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$rc" -ne 0 ]; then
             echo "::endgroup::"
             echo "::error title=Submit to $NAME failed::eas submit failed for track '$TRACK'. If the log says a Google Service Account Key cannot be set up, no Play key is available: add the PLAY_SERVICE_ACCOUNT secret or store one on EAS. 'You've already submitted this version' means the version code is already on a track: build again. Otherwise check that the track exists in Play Console."
             exit 1
@@ -1408,7 +1461,9 @@ jobs:
           ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url || steps.upload-fallback.outputs.artifact-url }}
           FALLBACK_UPLOAD: ${{ steps.upload-fallback.outputs.artifact-url }}
           RELEASE_URL: ${{ steps.release.outputs.url }}
-          SUBMITTED: ${{ steps.submit.outcome == 'success' }}
+          SUBMITTED: ${{ steps.submit.outcome == 'success' && steps.submit.outputs.queued != 'true' }}
+          SUBMIT_QUEUED: ${{ steps.submit.outputs.queued }}
+          SUBMIT_QUEUE_URL: ${{ steps.submit.outputs.queue-url }}
           SUBMITTED_TRACK: ${{ steps.submit.outputs.track }}
           VERSION_CODE: ${{ steps.build.outputs.version-code }}
           FIREBASE_OUTCOME: ${{ steps.firebase.outcome }}
@@ -1449,6 +1504,7 @@ jobs:
             elif [ "$FIREBASE_OUTCOME" = "failure" ]; then
               echo "| **Firebase** | ❌ Distribution failed (see the step log) |"
             fi
+            [ "$SUBMIT_QUEUED" = "true" ] && echo "| **Store** | ⏳ Submission not finished in time, probably queued on EAS. Not waiting further. [Monitor submission]($SUBMIT_QUEUE_URL)${SUBMITTED_TRACK:+ (Google Play: $SUBMITTED_TRACK)} |"
             [ "$SUBMITTED" = "true" ] && echo "| **Store** | Submitted with \`eas submit\`${SUBMITTED_TRACK:+ to Google Play: $SUBMITTED_TRACK} |"
             echo "| **Commit** | \`${SHA:0:7}\` |"
             echo ""
